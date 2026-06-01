@@ -632,8 +632,10 @@ def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
 def unload_llm(llm):
     del llm
     gc.collect()
-    torch.cuda.empty_cache()
-    log("  LLM unloaded, GPU memory cleared.")
+    # Do NOT call torch.cuda.empty_cache() here — it leaves CUDA initialized
+    # in the parent process, which causes vLLM's next fork to fail with
+    # "Cannot re-initialize CUDA in forked subprocess".
+    log("  LLM unloaded.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -928,13 +930,6 @@ def phase5_report(df: pd.DataFrame, llm_7b=None, sampling_params=None):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
-    # Must be set before any CUDA/GPU init so vLLM can fork cleanly.
-    import multiprocessing
-    try:
-        multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-
     t_start = time.perf_counter()
     log("EngramTrace Concept Verification Experiment — starting")
     log(f"Base directory: {BASE}")
@@ -991,4 +986,9 @@ def main():
 
 
 if __name__ == "__main__":
+    # Set BEFORE main() so it is in effect before vLLM imports multiprocessing.
+    # 'spawn' starts child processes fresh, avoiding CUDA re-init errors when
+    # vLLM forks its EngineCore after the parent process has touched CUDA.
+    import multiprocessing
+    multiprocessing.set_start_method("spawn", force=True)
     main()
