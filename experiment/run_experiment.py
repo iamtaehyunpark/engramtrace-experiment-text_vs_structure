@@ -194,10 +194,15 @@ def validate_xml(conv: dict, xml_str: str) -> bool:
     except ET.ParseError as e:
         log(f"  XML parse error: {e}", "ERROR")
         return False
-    all_text = " ".join(u.text or "" for u in root.iter("utterance"))
+    # Normalize all whitespace (incl. \n) to single spaces before comparing,
+    # because build_xml splits sentences and rejoins with spaces.
+    all_text = " ".join(
+        " ".join((u.text or "").split()) for u in root.iter("utterance")
+    )
     for session in conv["sessions"]:
         for turn in session["turns"]:
-            key = re.sub(r"<[^>]+>", "", turn["content"])[:30]
+            raw = re.sub(r"<[^>]+>", "", turn["content"])
+            key = " ".join(raw.split())[:30]   # normalize whitespace in key too
             if key and key not in all_text:
                 return False
     return True
