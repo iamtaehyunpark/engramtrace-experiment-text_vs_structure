@@ -328,7 +328,10 @@ def load_locomo() -> list:
         # QA pairs — filter unanswerable, map integer category to string
         qa_pairs = []
         for q_idx, qa in enumerate(item.get("qa", [])):
-            answer = str(qa["answer"]).strip()
+            answer = qa.get("answer")          # missing key = treat as unanswerable
+            if answer is None:
+                continue
+            answer = str(answer).strip()
             if answer.lower() == "unanswerable":
                 continue
             cat_int = qa.get("category", 1)
