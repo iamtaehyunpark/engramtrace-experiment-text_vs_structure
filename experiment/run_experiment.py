@@ -172,7 +172,7 @@ def build_xml(conv: dict) -> str:
     parts = ['<?xml version="1.0" encoding="UTF-8"?>', "<conversation>"]
     for s_idx, session in enumerate(conv["sessions"]):
         date = session.get("date", f"session-{s_idx+1}")
-        parts.append(f'  <session id="{s_idx+1}" date="{date}">')
+        parts.append(f'  <session id="{s_idx+1}" date="{escape_xml(str(date))}">')
         for turn in session["turns"]:
             speaker = escape_xml(turn["speaker"])
             ts      = turn.get("timestamp", "")
@@ -513,7 +513,7 @@ def assemble_prompt(cond: str, question: str, conv_id: str,
         prompt = (
             "You are a helpful assistant. Answer the question based on "
             "the retrieved conversation excerpts below.\n\n"
-            f"Retrieved Excerpts:\n{excerpts}\n\n"
+            f"Retrieved Excerpts (most relevant to the question):\n{excerpts}\n\n"
             f"Question: {question}\nAnswer:"
         )
     elif cond == "C":
@@ -742,9 +742,11 @@ def build_tables(df: pd.DataFrame):
              mean_input_tokens=("input_tokens","mean"),
              total_input_tokens=("input_tokens","sum"),
              mean_output_tokens=("output_tokens","mean"),
-             mean_time_ms=("inference_time_ms","mean"))
+             mean_time_ms=("inference_time_ms","mean"),
+             total_time_ms=("inference_time_ms","sum"))
         .reset_index()
     )
+    eff["total_time_min"] = eff["total_time_ms"] / 60000
     for m in eff["model"].unique():
         base = eff.loc[(eff["model"]==m)&(eff["condition"]=="A"), "mean_input_tokens"].values
         if len(base):
