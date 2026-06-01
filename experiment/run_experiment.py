@@ -857,26 +857,14 @@ def generate_llm_narrative(results_text: str, llm, sampling_params) -> str:
     return outputs[0].outputs[0].text.strip()
 
 
-def phase5_report(df: pd.DataFrame, llm_7b=None, sampling_params=None):
+def phase5_report(df: pd.DataFrame, narrative: str = ""):
     log("═" * 60)
-    log("PHASE 5 — Generating final report")
+    log("PHASE 5 — Assembling final report")
     log("═" * 60)
 
-    main, eff, sig = build_tables(df)
-    results_text = format_results_for_report(main, eff, sig)
+    n_qa = len(df[(df["condition"]=="A") & (df["model"]==MODEL_IDS["72B"])]) if "A" in df["condition"].values else "N/A"
+    results_text = format_results_for_report(*build_tables(df))
 
-    # ── LLM narrative (uses loaded 7B on H200) ────────────────────────────
-    narrative = ""
-    if llm_7b is not None:
-        log("  Generating paper section narrative with Qwen2.5-7B...")
-        try:
-            narrative = generate_llm_narrative(results_text, llm_7b, sampling_params)
-            log("  Narrative generated.")
-        except Exception as e:
-            log(f"  Narrative generation failed: {e}", "WARN")
-            narrative = "(Narrative generation failed — run manually with the results above.)"
-
-    # ── Assemble full report ──────────────────────────────────────────────
     report_lines = [
         "=" * 70,
         "  EngramTrace Concept Verification Experiment — Final Report",
@@ -884,8 +872,8 @@ def phase5_report(df: pd.DataFrame, llm_7b=None, sampling_params=None):
         "=" * 70,
         "",
         "EXPERIMENT SUMMARY",
-        "  Benchmark : LoCoMo (snap-research/LoCoMo, test split)",
-        f"  QA pairs  : {len(df[df['condition']=='A'][df['model']==MODEL_IDS['72B']]) if 'A' in df['condition'].values else 'N/A'} (per condition per model)",
+        "  Benchmark : LoCoMo (locomo10.json, 10 conversations)",
+        f"  QA pairs  : {n_qa} (per condition per model)",
         "  Models    : Qwen2.5-72B-Instruct, Qwen2.5-7B-Instruct",
         "  Conditions: A (Full Linear) | B (Flat RAG) | C (Full XML) | C2 (Hier. XML Retrieval) | D (No Memory)",
         "  Metrics   : F1, BLEU-1, ROUGE-L, ROUGE-2, METEOR, SBERT-sim",
@@ -928,6 +916,60 @@ def phase5_report(df: pd.DataFrame, llm_7b=None, sampling_params=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ── Subprocess entry points ──────────────────────────────────────────────────
+# Must be module-level functions so multiprocessing spawn can pickle them.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _inference_subprocess(model_tag: str):
+    """
+    Runs in a freshly spawned process — zero CUDA state inherited from parent.
+    Loads all representations from disk, runs vLLM for all conditions, saves JSONL.
+    """
+    log(f"[{model_tag} subprocess] Loading QA pairs and representations from disk...")
+    qa_pairs = [json.loads(l) for l in (QUESTIONS / "locomo_qa.jsonl").open()]
+    conv_ids = sorted({qa["conversation_id"] for qa in qa_pairs})
+    encoder  = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
+    reps     = load_representations(conv_ids)
+    llm      = run_inference_for_model(model_tag, qa_pairs, reps, encoder)
+    del llm, reps, encoder
+    gc.collect()
+    log(f"[{model_tag} subprocess] Done.")
+
+
+def _narrative_subprocess(results_text_path: str, out_path: str):
+    """
+    Runs in a freshly spawned process. Loads 7B, generates the paper narrative,
+    writes it to out_path.
+    """
+    from vllm import LLM, SamplingParams as SP
+    results_text = Path(results_text_path).read_text()
+    log("[narrative subprocess] Loading Qwen2.5-7B for narrative generation...")
+    llm = LLM(model=MODEL_IDS["7B"], dtype="bfloat16", max_model_len=32768,
+              gpu_memory_utilization=0.90, tensor_parallel_size=1)
+    narrative = generate_llm_narrative(results_text, llm, None)
+    Path(out_path).write_text(narrative)
+    log("[narrative subprocess] Done.")
+
+
+def _spawn(fn, *args, fatal: bool = True):
+    """Launch fn(*args) in a fresh spawned process and wait for it."""
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn")
+    p   = ctx.Process(target=fn, args=args)
+    p.start()
+    p.join()
+    if p.exitcode != 0:
+        msg = f"Subprocess {fn.__name__} exited with code {p.exitcode}"
+        if fatal:
+            log(msg, "ERROR")
+            sys.exit(1)
+        else:
+            log(f"{msg} (non-fatal, continuing)", "WARN")
+            return False
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # ── Main ─────────────────────────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -942,45 +984,40 @@ def main():
     log("Loading LoCoMo dataset...")
     dataset = load_locomo()
 
-    qa_path = QUESTIONS / "locomo_qa.jsonl"
-
-    # ── Phase 1: Build representations ─────────────────────────────────
+    # ── Phase 1: Build representations (CPU, runs in this process) ──────
     phase1_build(dataset)
 
-    # ── Load QA pairs + shared encoder ─────────────────────────────────
-    qa_pairs = [json.loads(l) for l in qa_path.open()]
-    log(f"QA pairs: {len(qa_pairs)}")
-    conv_ids = sorted({qa["conversation_id"] for qa in qa_pairs})
-
-    log("Loading sentence encoder for inference...")
-    encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
-    reps    = load_representations(conv_ids)
-
-    # ── Phase 2: Inference — 72B ────────────────────────────────────────
+    # ── Phase 2: Inference — 72B (fresh subprocess, no inherited CUDA) ──
     log("═" * 60)
     log("PHASE 2 — Inference (Qwen2.5-72B-Instruct)")
     log("═" * 60)
-    llm_72b = run_inference_for_model("72B", qa_pairs, reps, encoder)
-    unload_llm(llm_72b)
+    _spawn(_inference_subprocess, "72B")
 
-    # ── Phase 3: Inference — 7B ─────────────────────────────────────────
+    # ── Phase 3: Inference — 7B (fresh subprocess) ──────────────────────
     log("═" * 60)
     log("PHASE 3 — Inference (Qwen2.5-7B-Instruct)")
     log("═" * 60)
-    llm_7b = run_inference_for_model("7B", qa_pairs, reps, encoder)
-    # Keep llm_7b loaded for report generation in Phase 5
+    _spawn(_inference_subprocess, "7B")
 
-    del encoder, reps
-    gc.collect()
-
-    # ── Phase 4: Evaluation ─────────────────────────────────────────────
+    # ── Phase 4: Evaluation (CPU) ────────────────────────────────────────
     df = phase4_evaluate()
 
-    # ── Phase 5: Report (uses loaded 7B) ────────────────────────────────
-    from vllm import SamplingParams
-    sp_report = SamplingParams(temperature=0.3, max_tokens=1024)
-    phase5_report(df, llm_7b=llm_7b, sampling_params=sp_report)
-    unload_llm(llm_7b)
+    # ── Phase 5: Report ──────────────────────────────────────────────────
+    # Build tables first; then try to generate LLM narrative in a subprocess.
+    main_table, eff, sig = build_tables(df)
+    results_text = format_results_for_report(main_table, eff, sig)
+
+    narrative = ""
+    tmp_input  = EVAL / "tables" / "_results_text.tmp"
+    tmp_output = EVAL / "tables" / "_narrative.tmp"
+    tmp_input.write_text(results_text)
+    log("PHASE 5 — Generating LLM narrative (Qwen2.5-7B subprocess)...")
+    if _spawn(_narrative_subprocess, str(tmp_input), str(tmp_output), fatal=False):
+        narrative = tmp_output.read_text()
+    tmp_input.unlink(missing_ok=True)
+    tmp_output.unlink(missing_ok=True)
+
+    phase5_report(df, narrative=narrative)
 
     elapsed = (time.perf_counter() - t_start) / 3600
     log(f"Experiment complete. Total wall time: {elapsed:.2f} hours")
@@ -988,9 +1025,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Set BEFORE main() so it is in effect before vLLM imports multiprocessing.
-    # 'spawn' starts child processes fresh, avoiding CUDA re-init errors when
-    # vLLM forks its EngineCore after the parent process has touched CUDA.
-    import multiprocessing
-    multiprocessing.set_start_method("spawn", force=True)
     main()
