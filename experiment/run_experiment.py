@@ -18,6 +18,7 @@ Install first:
 # ─── stdlib ─────────────────────────────────────────────────────────────────
 import gc
 import json
+import os
 import re
 import sys
 import time
@@ -25,6 +26,10 @@ import urllib.request
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
+
+# Tell vLLM to use 'spawn' (not 'fork') for its worker processes.
+# vLLM defaults to 'fork', which fails when CUDA is initialized before forking.
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 # ─── third-party (must be installed before running) ─────────────────────────
 import faiss
@@ -857,13 +862,24 @@ def generate_llm_narrative(results_text: str, llm, sampling_params) -> str:
     return outputs[0].outputs[0].text.strip()
 
 
-def phase5_report(df: pd.DataFrame, narrative: str = ""):
+def phase5_report(df: pd.DataFrame, llm_7b=None, sampling_params=None):
     log("═" * 60)
-    log("PHASE 5 — Assembling final report")
+    log("PHASE 5 — Generating final report")
     log("═" * 60)
 
+    main_tbl, eff, sig = build_tables(df)
+    results_text = format_results_for_report(main_tbl, eff, sig)
+
+    narrative = ""
+    if llm_7b is not None:
+        log("  Generating paper section narrative with Qwen2.5-7B...")
+        try:
+            narrative = generate_llm_narrative(results_text, llm_7b, sampling_params)
+            log("  Narrative generated.")
+        except Exception as e:
+            log(f"  Narrative generation failed: {e}", "WARN")
+
     n_qa = len(df[(df["condition"]=="A") & (df["model"]==MODEL_IDS["72B"])]) if "A" in df["condition"].values else "N/A"
-    results_text = format_results_for_report(*build_tables(df))
 
     report_lines = [
         "=" * 70,
@@ -916,60 +932,6 @@ def phase5_report(df: pd.DataFrame, narrative: str = ""):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ── Subprocess entry points ──────────────────────────────────────────────────
-# Must be module-level functions so multiprocessing spawn can pickle them.
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _inference_subprocess(model_tag: str):
-    """
-    Runs in a freshly spawned process — zero CUDA state inherited from parent.
-    Loads all representations from disk, runs vLLM for all conditions, saves JSONL.
-    """
-    log(f"[{model_tag} subprocess] Loading QA pairs and representations from disk...")
-    qa_pairs = [json.loads(l) for l in (QUESTIONS / "locomo_qa.jsonl").open()]
-    conv_ids = sorted({qa["conversation_id"] for qa in qa_pairs})
-    encoder  = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
-    reps     = load_representations(conv_ids)
-    llm      = run_inference_for_model(model_tag, qa_pairs, reps, encoder)
-    del llm, reps, encoder
-    gc.collect()
-    log(f"[{model_tag} subprocess] Done.")
-
-
-def _narrative_subprocess(results_text_path: str, out_path: str):
-    """
-    Runs in a freshly spawned process. Loads 7B, generates the paper narrative,
-    writes it to out_path.
-    """
-    from vllm import LLM, SamplingParams as SP
-    results_text = Path(results_text_path).read_text()
-    log("[narrative subprocess] Loading Qwen2.5-7B for narrative generation...")
-    llm = LLM(model=MODEL_IDS["7B"], dtype="bfloat16", max_model_len=32768,
-              gpu_memory_utilization=0.90, tensor_parallel_size=1)
-    narrative = generate_llm_narrative(results_text, llm, None)
-    Path(out_path).write_text(narrative)
-    log("[narrative subprocess] Done.")
-
-
-def _spawn(fn, *args, fatal: bool = True):
-    """Launch fn(*args) in a fresh spawned process and wait for it."""
-    import multiprocessing as mp
-    ctx = mp.get_context("spawn")
-    p   = ctx.Process(target=fn, args=args)
-    p.start()
-    p.join()
-    if p.exitcode != 0:
-        msg = f"Subprocess {fn.__name__} exited with code {p.exitcode}"
-        if fatal:
-            log(msg, "ERROR")
-            sys.exit(1)
-        else:
-            log(f"{msg} (non-fatal, continuing)", "WARN")
-            return False
-    return True
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # ── Main ─────────────────────────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -984,40 +946,44 @@ def main():
     log("Loading LoCoMo dataset...")
     dataset = load_locomo()
 
-    # ── Phase 1: Build representations (CPU, runs in this process) ──────
+    qa_path = QUESTIONS / "locomo_qa.jsonl"
+
+    # ── Phase 1: Build representations ──────────────────────────────────
     phase1_build(dataset)
 
-    # ── Phase 2: Inference — 72B (fresh subprocess, no inherited CUDA) ──
+    # ── Load QA pairs + shared encoder ──────────────────────────────────
+    qa_pairs = [json.loads(l) for l in qa_path.open()]
+    log(f"QA pairs: {len(qa_pairs)}")
+    conv_ids = sorted({qa["conversation_id"] for qa in qa_pairs})
+
+    log("Loading sentence encoder for inference...")
+    encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
+    reps    = load_representations(conv_ids)
+
+    # ── Phase 2: Inference — 72B ─────────────────────────────────────────
     log("═" * 60)
     log("PHASE 2 — Inference (Qwen2.5-72B-Instruct)")
     log("═" * 60)
-    _spawn(_inference_subprocess, "72B")
+    llm_72b = run_inference_for_model("72B", qa_pairs, reps, encoder)
+    unload_llm(llm_72b)
 
-    # ── Phase 3: Inference — 7B (fresh subprocess) ──────────────────────
+    # ── Phase 3: Inference — 7B ──────────────────────────────────────────
     log("═" * 60)
     log("PHASE 3 — Inference (Qwen2.5-7B-Instruct)")
     log("═" * 60)
-    _spawn(_inference_subprocess, "7B")
+    llm_7b = run_inference_for_model("7B", qa_pairs, reps, encoder)
 
-    # ── Phase 4: Evaluation (CPU) ────────────────────────────────────────
+    del encoder, reps
+    gc.collect()
+
+    # ── Phase 4: Evaluation ──────────────────────────────────────────────
     df = phase4_evaluate()
 
-    # ── Phase 5: Report ──────────────────────────────────────────────────
-    # Build tables first; then try to generate LLM narrative in a subprocess.
-    main_table, eff, sig = build_tables(df)
-    results_text = format_results_for_report(main_table, eff, sig)
-
-    narrative = ""
-    tmp_input  = EVAL / "tables" / "_results_text.tmp"
-    tmp_output = EVAL / "tables" / "_narrative.tmp"
-    tmp_input.write_text(results_text)
-    log("PHASE 5 — Generating LLM narrative (Qwen2.5-7B subprocess)...")
-    if _spawn(_narrative_subprocess, str(tmp_input), str(tmp_output), fatal=False):
-        narrative = tmp_output.read_text()
-    tmp_input.unlink(missing_ok=True)
-    tmp_output.unlink(missing_ok=True)
-
-    phase5_report(df, narrative=narrative)
+    # ── Phase 5: Report (use loaded 7B for narrative) ────────────────────
+    from vllm import SamplingParams
+    sp_report = SamplingParams(temperature=0.3, max_tokens=1024)
+    phase5_report(df, llm_7b=llm_7b, sampling_params=sp_report)
+    unload_llm(llm_7b)
 
     elapsed = (time.perf_counter() - t_start) / 3600
     log(f"Experiment complete. Total wall time: {elapsed:.2f} hours")
