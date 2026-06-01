@@ -421,7 +421,7 @@ def phase1_build(dataset: list):
 
     # ── Encoder for B and C2 ──────────────────────────────────────────────
     log("  Loading sentence encoder (all-MiniLM-L6-v2)...")
-    encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
 
     # ── Condition B ──────────────────────────────────────────────────────
     log("  Building Condition B (chunks + FAISS)...")
@@ -674,7 +674,7 @@ def phase4_evaluate() -> pd.DataFrame:
 
     rouge = rouge_scorer_lib.RougeScorer(["rougeL", "rouge2"], use_stemmer=True)
     log("  Loading SBERT for semantic similarity...")
-    sbert = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    sbert = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
 
     all_records = []
     for cond in CONDITIONS:
@@ -928,6 +928,13 @@ def phase5_report(df: pd.DataFrame, llm_7b=None, sampling_params=None):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
+    # Must be set before any CUDA/GPU init so vLLM can fork cleanly.
+    import multiprocessing
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
     t_start = time.perf_counter()
     log("EngramTrace Concept Verification Experiment — starting")
     log(f"Base directory: {BASE}")
@@ -949,7 +956,7 @@ def main():
     conv_ids = sorted({qa["conversation_id"] for qa in qa_pairs})
 
     log("Loading sentence encoder for inference...")
-    encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
     reps    = load_representations(conv_ids)
 
     # ── Phase 2: Inference — 72B ────────────────────────────────────────
