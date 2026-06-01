@@ -21,6 +21,7 @@ import json
 import re
 import sys
 import time
+import urllib.request
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +31,6 @@ import faiss
 import numpy as np
 import pandas as pd
 import torch
-from datasets import load_dataset
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
 from nltk.translate.meteor_score import meteor_score
 from rouge_score import rouge_scorer as rouge_scorer_lib
@@ -57,7 +57,15 @@ MODELS          = ["72B", "7B"]
 CATEGORIES      = ["single_hop", "multi_hop", "temporal", "open_domain", "adversarial"]
 ALPHA           = 0.7   # hierarchical embedding blending coefficient
 K               = 5     # retrieval top-k
-N_QA            = 1540
+
+# Integer category labels used in locomo10.json → string names
+CATEGORY_MAP = {
+    1: "single_hop",
+    2: "multi_hop",
+    3: "temporal",
+    4: "open_domain",
+    5: "adversarial",
+}
 
 KEY_COMPARISONS = [
     ("A",  "C",  "C  vs A  (H1 — structure vs full linear)"),
@@ -275,34 +283,101 @@ def format_c2_context(retrieved: list) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ── Load and normalize LoCoMo ────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+
+def load_locomo() -> list:
+    """
+    Download locomo10.json from GitHub (cached to data/raw/) and normalize
+    into the internal format used by all builders:
+      conversation_id, sessions[{date, turns[{speaker, timestamp, content}]}],
+      qa_pairs[{id, question, answer, category, evidence}]
+    """
+    cache = DATA / "raw" / "locomo10.json"
+    if not cache.exists():
+        url = "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json"
+        log(f"  Downloading LoCoMo from GitHub...")
+        urllib.request.urlretrieve(url, cache)
+        log(f"  Saved to {cache}")
+    else:
+        log(f"  Using cached LoCoMo: {cache}")
+
+    raw = json.loads(cache.read_text())
+
+    conversations = []
+    for idx, item in enumerate(raw):
+        conv     = item["conversation"]
+        conv_id  = str(item.get("sample_id", idx))
+
+        # Sessions are stored as session_1, session_2, ... keys
+        sessions = []
+        s = 1
+        while f"session_{s}" in conv:
+            date_str = conv.get(f"session_{s}_date_time", f"Session {s}")
+            turns = [
+                {
+                    "speaker":   t["speaker"],
+                    "timestamp": t.get("dia_id", ""),
+                    "content":   t["text"],
+                }
+                for t in conv[f"session_{s}"]
+            ]
+            sessions.append({"date": date_str, "turns": turns})
+            s += 1
+
+        # QA pairs — filter unanswerable, map integer category to string
+        qa_pairs = []
+        for q_idx, qa in enumerate(item.get("qa", [])):
+            answer = str(qa["answer"]).strip()
+            if answer.lower() == "unanswerable":
+                continue
+            cat_int = qa.get("category", 1)
+            qa_pairs.append({
+                "id":       f"{conv_id}_q{q_idx}",
+                "question": qa["question"],
+                "answer":   answer,
+                "category": CATEGORY_MAP.get(cat_int, f"cat_{cat_int}"),
+                "evidence": qa.get("evidence", []),
+            })
+
+        conversations.append({
+            "conversation_id": conv_id,
+            "sessions":        sessions,
+            "qa_pairs":        qa_pairs,
+        })
+
+    total_qa = sum(len(c["qa_pairs"]) for c in conversations)
+    log(f"  {len(conversations)} conversations, {total_qa} answerable QA pairs loaded")
+    return conversations
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # ── Phase 1: Build all representations ──────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════
 
-def phase1_build(dataset):
+def phase1_build(dataset: list):
     log("═" * 60)
     log("PHASE 1 — Building representations")
     log("═" * 60)
 
-    # QA file
+    # QA file — already filtered (unanswerable removed) during load_locomo()
     qa_path = QUESTIONS / "locomo_qa.jsonl"
     if not qa_path.exists():
         records = []
         for conv in dataset:
             for qa in conv["qa_pairs"]:
-                if qa["answer"] != "unanswerable":
-                    records.append({
-                        "question_id":     qa["id"],
-                        "conversation_id": conv["conversation_id"],
-                        "category":        qa["category"],
-                        "question":        qa["question"],
-                        "answer":          qa["answer"],
-                        "evidence":        qa.get("evidence", []),
-                    })
+                records.append({
+                    "question_id":     qa["id"],
+                    "conversation_id": conv["conversation_id"],
+                    "category":        qa["category"],
+                    "question":        qa["question"],
+                    "answer":          qa["answer"],
+                    "evidence":        qa.get("evidence", []),
+                })
         with qa_path.open("w") as f:
             for r in records:
                 f.write(json.dumps(r) + "\n")
         log(f"  QA file: {len(records)} pairs saved")
-        assert len(records) == N_QA, f"Expected {N_QA} QA pairs, got {len(records)}"
     else:
         log(f"  QA file: exists, skipping")
 
@@ -374,16 +449,17 @@ def phase1_build(dataset):
     log(f"  Condition C2: {len(dataset)-skipped} built, {skipped} skipped")
 
     # Summary check
+    n_convs = len(dataset)
     for label, pat in [
-        ("A",         "condition_A/*.txt"),
-        ("B chunks",  "condition_B/chunks/*.json"),
-        ("B indices", "condition_B/embeddings/*.index"),
-        ("C",         "condition_C/*.xml"),
-        ("C2 nodes",  "condition_C2/nodes/*.json"),
-        ("C2 indices","condition_C2/embeddings/*.index"),
+        ("A",          "condition_A/*.txt"),
+        ("B chunks",   "condition_B/chunks/*.json"),
+        ("B indices",  "condition_B/embeddings/*.index"),
+        ("C",          "condition_C/*.xml"),
+        ("C2 nodes",   "condition_C2/nodes/*.json"),
+        ("C2 indices", "condition_C2/embeddings/*.index"),
     ]:
         n = len(list(DATA.glob(pat)))
-        ok = "✓" if n == 50 else f"WARNING {n}/50"
+        ok = "✓" if n == n_convs else f"WARNING {n}/{n_convs}"
         log(f"    {label}: {n} files [{ok}]")
 
     log("PHASE 1 complete.")
@@ -500,8 +576,9 @@ def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
     )
 
     for cond in conditions:
-        out_path = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
-        if jsonl_line_count(out_path) == N_QA:
+        out_path   = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
+        n_qa_total = len(qa_pairs)
+        if jsonl_line_count(out_path) == n_qa_total:
             log(f"  [{model_tag}] Condition {cond}: already complete, skipping")
             continue
 
@@ -851,10 +928,9 @@ def main():
 
     # ── Load LoCoMo ─────────────────────────────────────────────────────
     log("Loading LoCoMo dataset...")
-    dataset = load_dataset("snap-research/LoCoMo", split="test")
-    log(f"  {len(dataset)} conversations loaded")
+    dataset = load_locomo()
 
-    qa_path  = QUESTIONS / "locomo_qa.jsonl"
+    qa_path = QUESTIONS / "locomo_qa.jsonl"
 
     # ── Phase 1: Build representations ─────────────────────────────────
     phase1_build(dataset)
