@@ -27,10 +27,6 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-# Tell vLLM to use 'spawn' (not 'fork') for its worker processes.
-# vLLM defaults to 'fork', which fails when CUDA is initialized before forking.
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
 # ─── third-party (must be installed before running) ─────────────────────────
 import faiss
 import numpy as np
@@ -41,6 +37,7 @@ from nltk.translate.meteor_score import meteor_score
 from rouge_score import rouge_scorer as rouge_scorer_lib
 from scipy import stats
 from sentence_transformers import SentenceTransformer, util as st_util
+from transformers import AutoModelForCausalLM
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
@@ -566,81 +563,105 @@ def jsonl_line_count(path: Path) -> int:
 
 def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
                             encoder, conditions=None):
-    from vllm import LLM, SamplingParams
-
     model_id   = MODEL_IDS[model_tag]
     conditions = conditions or CONDITION_ORDER
-    log(f"  Loading tokenizer ({model_id})...")
-    tokenizer  = AutoTokenizer.from_pretrained(model_id)
 
-    log(f"  Loading vLLM ({model_id})...")
-    llm = LLM(
-        model=model_id,
-        dtype="bfloat16",
-        max_model_len=32768,
-        gpu_memory_utilization=0.90,
-        enforce_eager=False,
-        tensor_parallel_size=1,   # set to 2 if OOM on 72B
+    log(f"  Loading tokenizer ({model_id})...")
+    tokenizer = AutoTokenizer.from_pretrained(model_id, padding_side="left")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    log(f"  Loading model ({model_id}, bfloat16, device_map=auto)...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",          # splits 72B across 2 H200s automatically
     )
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        max_tokens=256,
-        stop=["\n\nQuestion:", "\n\nAnswer:"],
-    )
+    model.eval()
+
+    # Conservative batch sizes — 72B needs KV-cache headroom across 2 GPUs
+    BATCH_SIZE = 4 if "72B" in model_tag else 16
 
     for cond in conditions:
-        out_path   = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
-        n_qa_total = len(qa_pairs)
-        if jsonl_line_count(out_path) == n_qa_total:
+        out_path = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
+        if jsonl_line_count(out_path) == len(qa_pairs):
             log(f"  [{model_tag}] Condition {cond}: already complete, skipping")
             continue
 
         log(f"  [{model_tag}] Condition {cond}: assembling {len(qa_pairs)} prompts...")
-        assembled = []
-        for qa in tqdm(qa_pairs, desc=f"  Prompts {cond}", leave=False):
-            item = assemble_prompt(cond, qa["question"], qa["conversation_id"],
-                                   reps, encoder, tokenizer)
-            assembled.append({"qa": qa, **item})
+        assembled = [
+            {"qa": qa,
+             **assemble_prompt(cond, qa["question"], qa["conversation_id"],
+                               reps, encoder, tokenizer)}
+            for qa in tqdm(qa_pairs, desc=f"  Prompts {cond}", leave=False)
+        ]
 
-        log(f"  [{model_tag}] Condition {cond}: running batch inference...")
-        t0      = time.perf_counter()
-        outputs = llm.generate([a["prompt"] for a in assembled], sampling_params)
-        ms_per  = (time.perf_counter() - t0) / len(outputs) * 1000
-
+        log(f"  [{model_tag}] Condition {cond}: running inference (batch={BATCH_SIZE})...")
         results = []
-        for item, out in zip(assembled, outputs):
-            results.append({
-                "question_id":       item["qa"]["question_id"],
-                "conversation_id":   item["qa"]["conversation_id"],
-                "condition":         cond,
-                "model":             model_id,
-                "category":          item["qa"]["category"],
-                "question":          item["qa"]["question"],
-                "reference_answer":  item["qa"]["answer"],
-                "predicted_answer":  out.outputs[0].text.strip(),
-                "input_tokens":      item["input_tokens"],
-                "output_tokens":     len(out.outputs[0].token_ids),
-                "inference_time_ms": round(ms_per, 2),
-                "timestamp":         datetime.utcnow().isoformat(),
-                "f1": None, "bleu1": None, "rougeL": None,
-                "rouge2": None, "meteor": None, "sbert_sim": None,
-            })
+        t0 = time.perf_counter()
+
+        for i in tqdm(range(0, len(assembled), BATCH_SIZE),
+                      desc=f"  Batches {cond}", leave=False):
+            batch = assembled[i:i + BATCH_SIZE]
+            enc   = tokenizer(
+                [b["prompt"] for b in batch],
+                return_tensors="pt", padding=True,
+                truncation=True, max_length=32512,
+            ).to("cuda:0")
+
+            with torch.no_grad():
+                out_ids = model.generate(
+                    **enc,
+                    max_new_tokens=256,
+                    do_sample=False,
+                    temperature=None,           # must be None when do_sample=False
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+
+            input_len = enc["input_ids"].shape[1]
+            for item, full_out in zip(batch, out_ids):
+                new_ids   = full_out[input_len:]
+                predicted = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+                for stop in ["\n\nQuestion:", "\n\nAnswer:"]:
+                    if stop in predicted:
+                        predicted = predicted[:predicted.index(stop)].strip()
+                n_out = int((new_ids != tokenizer.pad_token_id).sum())
+                results.append({
+                    "question_id":       item["qa"]["question_id"],
+                    "conversation_id":   item["qa"]["conversation_id"],
+                    "condition":         cond,
+                    "model":             model_id,
+                    "category":          item["qa"]["category"],
+                    "question":          item["qa"]["question"],
+                    "reference_answer":  item["qa"]["answer"],
+                    "predicted_answer":  predicted,
+                    "input_tokens":      item["input_tokens"],
+                    "output_tokens":     n_out,
+                    "inference_time_ms": 0.0,
+                    "timestamp":         datetime.utcnow().isoformat(),
+                    "f1": None, "bleu1": None, "rougeL": None,
+                    "rouge2": None, "meteor": None, "sbert_sim": None,
+                })
+
+        ms_per = (time.perf_counter() - t0) / len(assembled) * 1000
+        for r in results:
+            r["inference_time_ms"] = round(ms_per, 2)
 
         with out_path.open("w") as f:
             for r in results:
                 f.write(json.dumps(r) + "\n")
-        log(f"  [{model_tag}] Condition {cond}: {len(results)} records saved ({ms_per:.1f} ms/query)")
+        log(f"  [{model_tag}] Condition {cond}: {len(results)} records ({ms_per:.1f} ms/query)")
 
-    return llm   # caller decides when to unload
+    return model, tokenizer
 
 
-def unload_llm(llm):
-    del llm
+def unload_llm(model_and_tok):
+    model, tok = model_and_tok
+    del model, tok
     gc.collect()
-    # Do NOT call torch.cuda.empty_cache() here — it leaves CUDA initialized
-    # in the parent process, which causes vLLM's next fork to fail with
-    # "Cannot re-initialize CUDA in forked subprocess".
-    log("  LLM unloaded.")
+    torch.cuda.empty_cache()
+    log("  Model unloaded, GPU memory cleared.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -825,8 +846,9 @@ def format_results_for_report(main: pd.DataFrame, eff: pd.DataFrame,
     return "\n".join(lines)
 
 
-def generate_llm_narrative(results_text: str, llm, sampling_params) -> str:
-    """Use the loaded LLM (on H200) to write the paper section based on results."""
+def generate_llm_narrative(results_text: str, model_and_tok, _unused=None) -> str:
+    """Use the loaded 7B model to write the paper section based on results."""
+    model, tokenizer = model_and_tok
     prompt = (
         "You are an expert NLP researcher writing an academic paper on EngramTrace, "
         "a hierarchical XML memory architecture for LLM agents.\n\n"
@@ -845,21 +867,19 @@ def generate_llm_narrative(results_text: str, llm, sampling_params) -> str:
               "at comparable token cost.\n\n"
         f"Experimental Results:\n{results_text}\n\n"
         "Write Section 4.1 of the paper: \"Validating the Structural Representation Hypothesis\".\n"
-        "The section should:\n"
-        "1. Briefly restate H1 and H2\n"
-        "2. Present the key quantitative findings with specific numbers\n"
-        "3. Highlight multi-hop and temporal question performance as the critical categories\n"
-        "4. Discuss the efficiency finding (C2 vs A token cost)\n"
-        "5. Note any unexpected results honestly\n"
-        "6. Conclude with what the results imply for the EngramTrace system design\n\n"
         "Write in the style of an ACL/EMNLP paper. Length: 450-650 words.\n\n"
         "Section 4.1: Validating the Structural Representation Hypothesis\n\n"
     )
-    from vllm import SamplingParams as SP
-    narrative_params = SP(temperature=0.3, max_tokens=1024,
-                          stop=["\n\nSection 4.2", "\n\nSection 5"])
-    outputs = llm.generate([prompt], narrative_params)
-    return outputs[0].outputs[0].text.strip()
+    enc = tokenizer([prompt], return_tensors="pt",
+                    truncation=True, max_length=31744).to("cuda:0")
+    with torch.no_grad():
+        out_ids = model.generate(
+            **enc, max_new_tokens=1024,
+            do_sample=True, temperature=0.3,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    input_len = enc["input_ids"].shape[1]
+    return tokenizer.decode(out_ids[0][input_len:], skip_special_tokens=True).strip()
 
 
 def phase5_report(df: pd.DataFrame, llm_7b=None, sampling_params=None):
@@ -980,9 +1000,7 @@ def main():
     df = phase4_evaluate()
 
     # ── Phase 5: Report (use loaded 7B for narrative) ────────────────────
-    from vllm import SamplingParams
-    sp_report = SamplingParams(temperature=0.3, max_tokens=1024)
-    phase5_report(df, llm_7b=llm_7b, sampling_params=sp_report)
+    phase5_report(df, llm_7b=llm_7b)
     unload_llm(llm_7b)
 
     elapsed = (time.perf_counter() - t_start) / 3600

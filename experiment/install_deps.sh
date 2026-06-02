@@ -1,16 +1,18 @@
 #!/bin/bash
 # Install all dependencies for the EngramTrace experiment.
-# vllm is installed first and alone — it pins compatible versions of torch
-# and transformers. Everything else is installed after.
+# Uses HuggingFace transformers for inference (compatible with CUDA 12.6).
+# PyTorch cu126 is installed first so everything links against it.
 
 set -e
 
-echo "=== Step 1: Install vLLM (pulls compatible torch + transformers) ==="
-pip install vllm
+echo "=== Step 1: PyTorch with CUDA 12.6 ==="
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 
 echo ""
-echo "=== Step 2: Install remaining dependencies ==="
+echo "=== Step 2: ML and experiment libraries ==="
 pip install \
+    accelerate \
+    transformers \
     datasets \
     sentence-transformers \
     faiss-cpu \
@@ -21,7 +23,7 @@ pip install \
     tqdm
 
 echo ""
-echo "=== Step 3: Download NLTK data ==="
+echo "=== Step 3: NLTK data ==="
 python -c "
 import nltk
 for pkg in ['punkt', 'wordnet', 'averaged_perceptron_tagger']:
@@ -30,11 +32,11 @@ for pkg in ['punkt', 'wordnet', 'averaged_perceptron_tagger']:
 "
 
 echo ""
-echo "=== Verifying imports ==="
+echo "=== Verifying ==="
 python -c "
-import importlib, sys
-libs = ['vllm','transformers','datasets','sentence_transformers',
-        'faiss','rouge_score','nltk','scipy','pandas','numpy','tqdm','torch']
+import importlib, sys, torch
+libs = ['torch','transformers','accelerate','datasets','sentence_transformers',
+        'faiss','rouge_score','nltk','scipy','pandas','numpy','tqdm']
 ok = True
 for lib in libs:
     try:
@@ -43,5 +45,8 @@ for lib in libs:
     except ImportError as e:
         print(f'  FAIL {lib}: {e}')
         ok = False
+print(f'  CUDA available : {torch.cuda.is_available()}')
+print(f'  GPU count      : {torch.cuda.device_count()}')
+print(f'  PyTorch version: {torch.__version__}')
 sys.exit(0 if ok else 1)
 "
