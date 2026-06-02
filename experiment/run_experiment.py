@@ -10,21 +10,20 @@ All outputs land in ./  (relative to this file). Resume-safe: every phase
 checks whether its output already exists and skips if complete.
 
 Install first:
-    pip install vllm transformers datasets sentence-transformers faiss-gpu \\
-                rouge-score nltk scipy pandas tqdm
+    bash install_deps.sh
     python -m nltk.downloader punkt wordnet averaged_perceptron_tagger
 """
 
 # ─── stdlib ─────────────────────────────────────────────────────────────────
 import gc
 import json
-import os
 import re
 import sys
 import time
 import urllib.request
+import xml.etree.ElementTree as ET
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ─── third-party (must be installed before running) ─────────────────────────
@@ -37,9 +36,8 @@ from nltk.translate.meteor_score import meteor_score
 from rouge_score import rouge_scorer as rouge_scorer_lib
 from scipy import stats
 from sentence_transformers import SentenceTransformer, util as st_util
-from transformers import AutoModelForCausalLM
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # ─── Directories ────────────────────────────────────────────────────────────
 BASE      = Path(__file__).parent.resolve()
@@ -83,7 +81,7 @@ KEY_COMPARISONS = [
 # ═══════════════════════════════════════════════════════════════════════════
 
 def log(msg: str, level: str = "INFO"):
-    ts = datetime.utcnow().strftime("%H:%M:%S")
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     print(f"[{ts}] [{level}] {msg}", flush=True)
 
 
@@ -170,7 +168,6 @@ def escape_xml(text: str) -> str:
 
 
 def build_xml(conv: dict) -> str:
-    import xml.etree.ElementTree as ET   # stdlib
     parts = ['<?xml version="1.0" encoding="UTF-8"?>', "<conversation>"]
     for s_idx, session in enumerate(conv["sessions"]):
         date = session.get("date", f"session-{s_idx+1}")
@@ -190,7 +187,6 @@ def build_xml(conv: dict) -> str:
 
 
 def validate_xml(conv: dict, xml_str: str) -> bool:
-    import xml.etree.ElementTree as ET
     try:
         root = ET.fromstring(xml_str)
     except ET.ParseError as e:
@@ -215,7 +211,6 @@ def validate_xml(conv: dict, xml_str: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def extract_nodes(xml_str: str) -> list:
-    import xml.etree.ElementTree as ET
     root  = ET.fromstring(xml_str)
     nodes = []
 
@@ -639,7 +634,7 @@ def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
                     "input_tokens":      item["input_tokens"],
                     "output_tokens":     n_out,
                     "inference_time_ms": 0.0,
-                    "timestamp":         datetime.utcnow().isoformat(),
+                    "timestamp":         datetime.now(timezone.utc).isoformat(),
                     "f1": None, "bleu1": None, "rougeL": None,
                     "rouge2": None, "meteor": None, "sbert_sim": None,
                 })
@@ -846,7 +841,7 @@ def format_results_for_report(main: pd.DataFrame, eff: pd.DataFrame,
     return "\n".join(lines)
 
 
-def generate_llm_narrative(results_text: str, model_and_tok, _unused=None) -> str:
+def generate_llm_narrative(results_text: str, model_and_tok) -> str:
     """Use the loaded 7B model to write the paper section based on results."""
     model, tokenizer = model_and_tok
     prompt = (
@@ -882,7 +877,7 @@ def generate_llm_narrative(results_text: str, model_and_tok, _unused=None) -> st
     return tokenizer.decode(out_ids[0][input_len:], skip_special_tokens=True).strip()
 
 
-def phase5_report(df: pd.DataFrame, llm_7b=None, sampling_params=None):
+def phase5_report(df: pd.DataFrame, llm_7b=None):
     log("═" * 60)
     log("PHASE 5 — Generating final report")
     log("═" * 60)
@@ -894,7 +889,7 @@ def phase5_report(df: pd.DataFrame, llm_7b=None, sampling_params=None):
     if llm_7b is not None:
         log("  Generating paper section narrative with Qwen2.5-7B...")
         try:
-            narrative = generate_llm_narrative(results_text, llm_7b, sampling_params)
+            narrative = generate_llm_narrative(results_text, llm_7b)
             log("  Narrative generated.")
         except Exception as e:
             log(f"  Narrative generation failed: {e}", "WARN")
@@ -904,7 +899,7 @@ def phase5_report(df: pd.DataFrame, llm_7b=None, sampling_params=None):
     report_lines = [
         "=" * 70,
         "  EngramTrace Concept Verification Experiment — Final Report",
-        f"  Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+        f"  Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         "=" * 70,
         "",
         "EXPERIMENT SUMMARY",
