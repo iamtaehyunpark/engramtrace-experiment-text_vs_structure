@@ -110,9 +110,9 @@ if __name__ == '__main__':
         llm_72b = LLM(
             model="Qwen/Qwen2.5-72B-Instruct",
             dtype="bfloat16",
-            tensor_parallel_size=2,
+            tensor_parallel_size=4,
             max_model_len=4096,
-            gpu_memory_utilization=0.95,
+            gpu_memory_utilization=0.90,
             enforce_eager=False,
             distributed_executor_backend="mp",
         )
