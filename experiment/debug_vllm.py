@@ -90,10 +90,10 @@ if __name__ == '__main__':
         sys.exit(1)
 
     # ── 6. Tokenizer load (72B) ──────────────────────────────────────────────
-    section("6. Tokenizer load (Qwen2.5-72B-Instruct)")
+    section("6. Tokenizer load (Qwen2.5-72B-Instruct-AWQ)")
     try:
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-72B-Instruct")
+        tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-72B-Instruct-AWQ")
         print(f"  OK: vocab_size={tok.vocab_size}")
     except Exception:
         print("  [FATAL] tokenizer load failed:")
@@ -108,9 +108,9 @@ if __name__ == '__main__':
     llm_72b = None
     try:
         llm_72b = LLM(
-            model="Qwen/Qwen2.5-72B-Instruct",
-            dtype="bfloat16",
-            tensor_parallel_size=4,
+            model="Qwen/Qwen2.5-72B-Instruct-AWQ",
+            dtype="float16",
+            tensor_parallel_size=2,
             max_model_len=4096,
             gpu_memory_utilization=0.90,
             enforce_eager=False,

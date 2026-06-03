@@ -48,7 +48,7 @@ EVAL      = BASE / "evaluation"
 
 # ─── Experiment constants ────────────────────────────────────────────────────
 MODEL_IDS = {
-    "72B": "Qwen/Qwen2.5-72B-Instruct",
+    "72B": "Qwen/Qwen2.5-72B-Instruct-AWQ",
     "7B":  "Qwen/Qwen2.5-7B-Instruct",
 }
 CONDITION_ORDER = ["D", "B", "C2", "C", "A"]   # shortest → longest prompt
