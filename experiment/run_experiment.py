@@ -540,9 +540,17 @@ def assemble_prompt(cond: str, question: str, conv_id: str,
         )
     else:
         raise ValueError(f"Unknown condition: {cond}")
+
+    # Truncate if prompt exceeds model's context limit (leave 256 tokens for output)
+    max_input = tokenizer.model_max_length - 256
+    ids = tokenizer.encode(prompt, add_special_tokens=False)
+    if len(ids) > max_input:
+        ids = ids[:max_input]
+        prompt = tokenizer.decode(ids, skip_special_tokens=True)
+
     return {
         "prompt":       prompt,
-        "input_tokens": len(tokenizer.encode(prompt, add_special_tokens=False)),
+        "input_tokens": len(ids),
     }
 
 
@@ -558,7 +566,7 @@ def jsonl_line_count(path: Path) -> int:
 
 def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
                             encoder, conditions=None,
-                            tensor_parallel_size=4, max_model_len=32768,
+                            tensor_parallel_size=4,
                             gpu_memory_utilization=0.90):
     model_id   = MODEL_IDS[model_tag]
     conditions = conditions or CONDITION_ORDER
@@ -567,12 +575,11 @@ def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     from vllm import LLM, SamplingParams
-    log(f"  Loading vLLM model ({model_id}, tp={tensor_parallel_size}, max_len={max_model_len})...")
+    log(f"  Loading vLLM model ({model_id}, tp={tensor_parallel_size})...")
     llm = LLM(
         model=model_id,
         dtype="bfloat16",
         tensor_parallel_size=tensor_parallel_size,
-        max_model_len=max_model_len,
         gpu_memory_utilization=gpu_memory_utilization,
         enforce_eager=False,
         distributed_executor_backend="mp",
@@ -931,26 +938,22 @@ def main():
 
     # GPU profiles
     if args_cli.gpu == "a100x8":
-        TP   = 8
-        MLEN = 32768
-        MEM  = 0.90
+        TP  = 8
+        MEM = 0.90
     elif args_cli.gpu == "a100x2":
-        TP   = 2
-        MLEN = 40960
-        MEM  = 0.95
+        TP  = 2
+        MEM = 0.95
     elif args_cli.gpu == "a6000x4":
-        TP   = 4
-        MLEN = 32768
-        MEM  = 0.90
+        TP  = 4
+        MEM = 0.90
     else:  # h200x4
-        TP   = 4
-        MLEN = 32768
-        MEM  = 0.90
+        TP  = 4
+        MEM = 0.90
 
     t_start = time.perf_counter()
     log("EngramTrace Concept Verification Experiment — starting")
     log(f"Base directory: {BASE}")
-    log(f"GPU profile   : {args_cli.gpu}  (tp={TP}, max_model_len={MLEN})")
+    log(f"GPU profile   : {args_cli.gpu}  (tp={TP}, gpu_mem={MEM})")
 
     ensure_dirs()
 
@@ -978,7 +981,6 @@ def main():
     log("═" * 60)
     llm_72b = run_inference_for_model("72B", qa_pairs, reps, encoder,
                                       tensor_parallel_size=TP,
-                                      max_model_len=MLEN,
                                       gpu_memory_utilization=MEM)
     unload_llm(llm_72b)
 
@@ -988,7 +990,6 @@ def main():
     log("═" * 60)
     llm_7b = run_inference_for_model("7B", qa_pairs, reps, encoder,
                                      tensor_parallel_size=TP,
-                                     max_model_len=MLEN,
                                      gpu_memory_utilization=MEM)
 
     del encoder, reps
