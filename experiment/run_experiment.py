@@ -639,7 +639,14 @@ def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
 
 def unload_llm(model_and_tok):
     llm, tok = model_and_tok
+    try:
+        llm.llm_engine.shutdown()
+    except Exception:
+        pass
     del llm, tok
+    gc.collect()
+    torch.cuda.empty_cache()
+    time.sleep(20)  # wait for worker processes to fully exit and release GPU memory
     gc.collect()
     torch.cuda.empty_cache()
     log("  Model unloaded, GPU memory cleared.")
