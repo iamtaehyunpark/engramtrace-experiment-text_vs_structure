@@ -936,7 +936,7 @@ def main():
         MEM  = 0.90
     elif args_cli.gpu == "a100x2":
         TP   = 2
-        MLEN = 16384
+        MLEN = 40960
         MEM  = 0.95
     elif args_cli.gpu == "a6000x4":
         TP   = 4
