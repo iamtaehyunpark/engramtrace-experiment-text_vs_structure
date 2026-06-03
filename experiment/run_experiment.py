@@ -925,16 +925,20 @@ def phase5_report(df: pd.DataFrame, llm_7b=None):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu", choices=["h200x4", "a100x2"], default="h200x4",
+    parser.add_argument("--gpu", choices=["h200x4", "a100x2", "a100x8"], default="h200x4",
                         help="GPU profile: h200x4 (default) or a100x2")
     args_cli = parser.parse_args()
 
     # GPU profiles
-    if args_cli.gpu == "a100x2":
+    if args_cli.gpu == "a100x8":
+        TP   = 8
+        MLEN = 32768
+        MEM  = 0.90
+    elif args_cli.gpu == "a100x2":
         TP   = 2
-        MLEN = 16384   # 72B fits in 2×80GB but needs reduced context
+        MLEN = 16384
         MEM  = 0.95
-    else:
+    else:  # h200x4
         TP   = 4
         MLEN = 32768
         MEM  = 0.90
