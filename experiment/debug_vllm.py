@@ -89,80 +89,26 @@ if __name__ == '__main__':
         traceback.print_exc()
         sys.exit(1)
 
-    # ── 6. Tokenizer load ────────────────────────────────────────────────────
-    section("6. Tokenizer load (Qwen2.5-7B-Instruct)")
-    MODEL = "Qwen/Qwen2.5-7B-Instruct"
+    # ── 6. Tokenizer load (72B) ──────────────────────────────────────────────
+    section("6. Tokenizer load (Qwen2.5-72B-Instruct)")
     try:
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(MODEL)
+        tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-72B-Instruct")
         print(f"  OK: vocab_size={tok.vocab_size}")
     except Exception:
         print("  [FATAL] tokenizer load failed:")
         traceback.print_exc()
         sys.exit(1)
 
-    # ── 7. LLM init — 2 GPU (A100×2) ────────────────────────────────────────
-    section("7. LLM init (tensor_parallel_size=2, bfloat16, mp backend)")
-    llm = None
-    try:
-        llm = LLM(
-            model=MODEL,
-            dtype="bfloat16",
-            tensor_parallel_size=2,
-            max_model_len=4096,
-            gpu_memory_utilization=0.80,
-            enforce_eager=False,
-            distributed_executor_backend="mp",  # avoid Ray
-        )
-        print("  OK: LLM initialized with 2 GPUs")
-    except Exception:
-        print("  [ERROR] 2-GPU LLM init failed:")
-        traceback.print_exc()
-
-    # ── 7b. Fallback — 1 GPU ─────────────────────────────────────────────────
-    if llm is None:
-        section("7b. Fallback: tensor_parallel_size=1, enforce_eager=True")
-        try:
-            llm = LLM(
-                model=MODEL,
-                dtype="bfloat16",
-                tensor_parallel_size=1,
-                max_model_len=4096,
-                gpu_memory_utilization=0.80,
-                enforce_eager=True,
-                distributed_executor_backend="mp",
-            )
-            print("  OK: LLM initialized (single GPU, eager)")
-        except Exception:
-            print("  [FATAL] single-GPU fallback also failed:")
-            traceback.print_exc()
-            sys.exit(1)
-
-    # ── 8. Generate (7B) ─────────────────────────────────────────────────────
-    section("8. Test generation (7B)")
-    try:
-        sp = SamplingParams(temperature=0.0, max_tokens=64)
-        prompt = "What is 2 + 2? Answer in one sentence."
-        print(f"  Prompt: {prompt!r}")
-        outputs = llm.generate([prompt], sp)
-        print(f"  Response: {outputs[0].outputs[0].text.strip()!r}")
-        print("  OK")
-    except Exception:
-        print("  [FATAL] generate failed:")
-        traceback.print_exc()
-        sys.exit(1)
-
-    # ── 9. 72B LLM init ──────────────────────────────────────────────────────
-    section("9. LLM init 72B (tensor_parallel_size=2, bfloat16)")
-    del llm
+    # ── 7. 72B LLM init ──────────────────────────────────────────────────────
+    section("7. LLM init 72B (tensor_parallel_size=2, bfloat16)")
     import gc, torch
     gc.collect()
     torch.cuda.empty_cache()
-    MODEL_72B = "Qwen/Qwen2.5-72B-Instruct"
     llm_72b = None
     try:
         llm_72b = LLM(
-            model=MODEL_72B,
+            model="Qwen/Qwen2.5-72B-Instruct",
             dtype="bfloat16",
             tensor_parallel_size=2,
             max_model_len=4096,
@@ -175,9 +121,9 @@ if __name__ == '__main__':
         print("  [ERROR] 72B init failed:")
         traceback.print_exc()
 
-    # ── 10. Generate (72B) ───────────────────────────────────────────────────
+    # ── 8. Generate (72B) ────────────────────────────────────────────────────
     if llm_72b is not None:
-        section("10. Test generation (72B)")
+        section("8. Test generation (72B)")
         try:
             sp = SamplingParams(temperature=0.0, max_tokens=64)
             prompt = "What is 2 + 2? Answer in one sentence."
