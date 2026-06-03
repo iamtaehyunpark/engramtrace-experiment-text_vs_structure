@@ -587,7 +587,7 @@ def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
         max_tokens=256,
         stop=["\n\nQuestion:", "\n\nAnswer:"],
     )
-    max_input_tokens = llm.llm_engine.model_config.max_model_len - 256
+    max_input_tokens = llm.llm_engine.model_config.max_model_len - sampling_params.max_tokens
     log(f"  Max input tokens: {max_input_tokens}")
 
     for cond in conditions:
