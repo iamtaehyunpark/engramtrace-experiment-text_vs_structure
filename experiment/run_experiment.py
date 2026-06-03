@@ -38,7 +38,6 @@ from scipy import stats
 from sentence_transformers import SentenceTransformer, util as st_util
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
 
 # ─── Directories ────────────────────────────────────────────────────────────
 BASE      = Path(__file__).parent.resolve()
@@ -565,6 +564,7 @@ def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
     log(f"  Loading tokenizer ({model_id})...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
+    from vllm import LLM, SamplingParams
     log(f"  Loading vLLM model ({model_id}, tensor_parallel_size=4)...")
     llm = LLM(
         model=model_id,
