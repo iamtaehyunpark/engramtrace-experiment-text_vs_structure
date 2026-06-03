@@ -545,10 +545,9 @@ def assemble_prompt(cond: str, question: str, conv_id: str,
     ids = tokenizer.encode(prompt, add_special_tokens=False)
     if max_input_tokens and len(ids) > max_input_tokens:
         ids = ids[:max_input_tokens]
-        prompt = tokenizer.decode(ids, skip_special_tokens=True)
 
     return {
-        "prompt":       prompt,
+        "prompt":       {"prompt_token_ids": ids},
         "input_tokens": len(ids),
     }
 
@@ -605,7 +604,7 @@ def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
             for qa in tqdm(qa_pairs, desc=f"  Prompts {cond}", leave=False)
         ]
 
-        prompts = [a["prompt"] for a in assembled]
+        prompts = [a["prompt"] for a in assembled]  # each is {"prompt_token_ids": [...]}
         log(f"  [{model_tag}] Condition {cond}: running vLLM batch inference ({len(prompts)} prompts)...")
         t0 = time.perf_counter()
         outputs = llm.generate(prompts, sampling_params)
