@@ -7,6 +7,8 @@ from collections import Counter
 import numpy as np
 import faiss
 
+ALPHA = 0.7
+
 
 # ---------------------------------------------------------------------------
 # Condition A — Linear text
@@ -116,9 +118,6 @@ def validate_xml(original: dict, xml_str: str) -> bool:
 # Condition C2 — Hierarchical XML retrieval
 # ---------------------------------------------------------------------------
 
-ALPHA = 0.7
-
-
 def extract_nodes(xml_str: str) -> list:
     """
     Parse XML into a flat node list. Each node stores its parent_id so we can
@@ -208,6 +207,107 @@ def format_c2_context(retrieved: list) -> str:
         parts.append(
             f"--- Retrieved Node {i+1} [path: {path} > <{node['tag']}>] ---\n"
             f"{node['xml_snippet']}"
+        )
+    return '\n\n'.join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Condition E — Structured HTML
+# ---------------------------------------------------------------------------
+
+def escape_html(text: str) -> str:
+    return (text
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;'))
+
+
+def build_html(conversation: dict) -> str:
+    """Render conversation as well-formed HTML parseable by ElementTree."""
+    parts = ['<html>']
+    for s_idx, session in enumerate(conversation['sessions']):
+        date = session.get('date', f'session-{s_idx+1}')
+        parts.append(f'  <section id="s{s_idx+1}" data-date="{escape_html(str(date))}">')
+        for turn in session['turns']:
+            speaker = escape_html(turn['speaker'])
+            ts      = turn.get('timestamp', '')
+            content = re.sub(r'<[^>]+>', '', turn['content'])
+            parts.append(f'    <div data-speaker="{speaker}" data-timestamp="{ts}">')
+            for sent in re.split(r'(?<=[.!?])\s+', content.strip()):
+                if sent.strip():
+                    parts.append(f'      <p>{escape_html(sent.strip())}</p>')
+            parts.append('    </div>')
+        parts.append('  </section>')
+    parts.append('</html>')
+    return '\n'.join(parts)
+
+
+def validate_html(original: dict, html_str: str) -> bool:
+    try:
+        root = ET.fromstring(html_str)
+    except ET.ParseError as e:
+        print(f'  HTML parse error: {e}')
+        return False
+    all_text = ' '.join(' '.join((p.text or '').split()) for p in root.iter('p'))
+    for session in original['sessions']:
+        for turn in session['turns']:
+            raw = re.sub(r'<[^>]+>', '', turn['content'])
+            key = ' '.join(raw.split())[:30]
+            if key and key not in all_text:
+                return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Condition E2 — Hierarchical HTML retrieval
+# ---------------------------------------------------------------------------
+
+def extract_html_nodes(html_str: str) -> list:
+    root  = ET.fromstring(html_str)
+    nodes = []
+
+    def recurse(el, parent_id: int, depth: int, path: list):
+        node_id     = len(nodes)
+        direct_text = (el.text or '').strip()
+        for child in el:
+            if child.tail:
+                direct_text += ' ' + child.tail.strip()
+        attribs    = ' '.join(f'{k}="{v}"' for k, v in el.attrib.items())
+        path_entry = (f'<{el.tag} {attribs}>').strip() if attribs else f'<{el.tag}>'
+        nodes.append({
+            'node_id':      node_id,
+            'tag':          el.tag,
+            'text_content': direct_text,
+            'full_path':    path + [path_entry],
+            'depth':        depth,
+            'parent_id':    parent_id,
+            'html_snippet': ET.tostring(el, encoding='unicode'),
+        })
+        for child in el:
+            recurse(child, node_id, depth + 1, path + [path_entry])
+
+    recurse(root, -1, 0, [])
+    return nodes
+
+
+def build_e2_index(nodes: list, encoder) -> faiss.Index:
+    hier_embs = compute_hierarchical_embeddings(nodes, encoder)
+    index     = faiss.IndexFlatIP(hier_embs.shape[1])
+    index.add(hier_embs)
+    return index
+
+
+def format_e2_context(retrieved: list) -> str:
+    parts = []
+    for i, item in enumerate(retrieved):
+        node      = item['node']
+        ancestors = item['ancestors']
+        path      = (' > '.join(f"<{a['tag']}>" for a in ancestors)
+                     if ancestors else '<root>')
+        parts.append(
+            f"--- Retrieved Node {i+1} [path: {path} > <{node['tag']}>] ---\n"
+            f"{node['html_snippet']}"
         )
     return '\n\n'.join(parts)
 

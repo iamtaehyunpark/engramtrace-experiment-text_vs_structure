@@ -28,6 +28,10 @@ from utils import (
     validate_xml,
     extract_nodes,
     build_c2_index,
+    build_html,
+    validate_html,
+    extract_html_nodes,
+    build_e2_index,
 )
 
 
@@ -158,6 +162,59 @@ def build_condition_c2(dataset, data_dir: Path, encoder):
     print(f"  Condition C2: {built} built, {skipped} skipped, {missing_xml} missing XML")
 
 
+def build_condition_e(dataset, data_dir: Path) -> list:
+    """Returns list of conversation_ids that failed validation."""
+    out_dir = data_dir / 'condition_E'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    failures = []
+    skipped  = 0
+    for conv in tqdm(dataset, desc='Condition E (HTML)'):
+        cid  = conv['conversation_id']
+        path = out_dir / f'{cid}.html'
+        if path.exists():
+            skipped += 1
+            continue
+        html_str = build_html(conv)
+        if not validate_html(conv, html_str):
+            failures.append(cid)
+            print(f'  VALIDATION FAILED (HTML): {cid}')
+        else:
+            path.write_text(html_str)
+    built = len(dataset) - skipped - len(failures)
+    print(f'  Condition E: {built} built, {skipped} skipped, {len(failures)} failed')
+    return failures
+
+
+def build_condition_e2(dataset, data_dir: Path, encoder):
+    node_dir  = data_dir / 'condition_E2' / 'nodes'
+    emb_dir   = data_dir / 'condition_E2' / 'embeddings'
+    html_dir  = data_dir / 'condition_E'
+    node_dir.mkdir(parents=True, exist_ok=True)
+    emb_dir.mkdir(parents=True, exist_ok=True)
+    skipped = 0
+    missing_html = 0
+    for conv in tqdm(dataset, desc='Condition E2'):
+        cid        = conv['conversation_id']
+        node_path  = node_dir / f'{cid}.json'
+        index_path = emb_dir  / f'{cid}.index'
+        if node_path.exists() and index_path.exists():
+            skipped += 1
+            continue
+        html_path = html_dir / f'{cid}.html'
+        if not html_path.exists():
+            missing_html += 1
+            print(f'  Missing HTML for {cid}, skipping E2')
+            continue
+        html_str = html_path.read_text()
+        nodes    = extract_html_nodes(html_str)
+        index    = build_e2_index(nodes, encoder)
+        with node_path.open('w') as f:
+            json.dump(nodes, f)
+        faiss.write_index(index, str(index_path))
+    built = len(dataset) - skipped - missing_html
+    print(f'  Condition E2: {built} built, {skipped} skipped, {missing_html} missing HTML')
+
+
 def main():
     args     = parse_args()
     data_dir = Path(args.data_dir)
@@ -167,15 +224,15 @@ def main():
     dataset = load_locomo()
 
     # QA file
-    print("\n[1/5] Building QA file...")
+    print("\n[1/7] Building QA file...")
     build_qa_file(dataset, base_dir / 'questions' / 'locomo_qa.jsonl')
 
     # Condition A — CPU only
-    print("\n[2/5] Building Condition A (linear text)...")
+    print("\n[2/7] Building Condition A (linear text)...")
     build_condition_a(dataset, data_dir)
 
     # Condition C — CPU only (must succeed 100% before C2 and before inference)
-    print("\n[3/5] Building Condition C (XML)...")
+    print("\n[3/7] Building Condition C (XML)...")
     failures = build_condition_c(dataset, data_dir)
     if failures:
         print(f"\nERROR: {len(failures)} XML validation failures. "
@@ -183,15 +240,28 @@ def main():
         sys.exit(1)
     print("  All XML files passed validation.")
 
-    # Encoder needed for B and C2
-    print("\n[4/5] Building Condition B (chunked RAG)...")
+    # Condition E — HTML (analogous to C)
+    print("\n[4/7] Building Condition E (HTML)...")
+    failures = build_condition_e(dataset, data_dir)
+    if failures:
+        print(f"\nERROR: {len(failures)} HTML validation failures. "
+              "Fix before proceeding.\n  Failed: " + ', '.join(failures))
+        sys.exit(1)
+    print("  All HTML files passed validation.")
+
+    # Encoder needed for B, C2, E2
+    print("\n[5/7] Building Condition B (chunked RAG)...")
     print("  Loading sentence encoder...")
     encoder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
     build_condition_b(dataset, data_dir, encoder)
 
     # Condition C2 — reuses XML from Condition C
-    print("\n[5/5] Building Condition C2 (hierarchical XML)...")
+    print("\n[6/7] Building Condition C2 (hierarchical XML)...")
     build_condition_c2(dataset, data_dir, encoder)
+
+    # Condition E2 — reuses HTML from Condition E
+    print("\n[7/7] Building Condition E2 (hierarchical HTML)...")
+    build_condition_e2(dataset, data_dir, encoder)
 
     # Final summary
     print("\n=== Phase 1 complete ===")
@@ -202,6 +272,9 @@ def main():
         ('C', 'condition_C/*.xml'),
         ('C2 nodes', 'condition_C2/nodes/*.json'),
         ('C2 indices', 'condition_C2/embeddings/*.index'),
+        ('E', 'condition_E/*.html'),
+        ('E2 nodes', 'condition_E2/nodes/*.json'),
+        ('E2 indices', 'condition_E2/embeddings/*.index'),
     ]:
         count = len(list(data_dir.glob(subpath)))
         status = '✓' if count == 50 else f'WARNING: {count}/50'

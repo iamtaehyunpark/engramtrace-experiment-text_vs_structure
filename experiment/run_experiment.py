@@ -51,8 +51,8 @@ MODEL_IDS = {
     "72B": "Qwen/Qwen2.5-72B-Instruct-AWQ",
     "7B":  "Qwen/Qwen2.5-7B-Instruct",
 }
-CONDITION_ORDER = ["D", "B", "C2", "C", "A"]   # shortest → longest prompt
-CONDITIONS      = ["A", "B", "C", "C2", "D"]
+CONDITION_ORDER = ["D", "B", "C2", "E2", "C", "E", "A"]  # shortest → longest prompt
+CONDITIONS      = ["A", "B", "C", "C2", "D", "E", "E2"]
 MODELS          = ["72B", "7B"]
 CATEGORIES      = ["single_hop", "multi_hop", "temporal", "open_domain", "adversarial"]
 ALPHA           = 0.7   # hierarchical embedding blending coefficient
@@ -68,11 +68,17 @@ CATEGORY_MAP = {
 }
 
 KEY_COMPARISONS = [
-    ("A",  "C",  "C  vs A  (H1 — structure vs full linear)"),
-    ("B",  "C2", "C2 vs B  (H2 — hierarchical vs flat RAG)"),
-    ("A",  "C2", "C2 vs A  (efficiency — retrieval vs full context)"),
-    ("C",  "C2", "C2 vs C  (retrieval over XML vs full XML)"),
-    ("A",  "B",  "B  vs A  (flat RAG vs full context, lit replication)"),
+    ("A",  "C",  "C   vs A  (H1 — XML structure vs full linear)"),
+    ("B",  "C2", "C2  vs B  (H2 — hierarchical XML vs flat RAG)"),
+    ("A",  "E",  "E   vs A  (H3 — HTML structure vs full linear)"),
+    ("B",  "E2", "E2  vs B  (H4 — hierarchical HTML vs flat RAG)"),
+    ("C",  "E",  "E   vs C  (HTML vs XML, full context)"),
+    ("C2", "E2", "E2  vs C2 (HTML vs XML, hierarchical retrieval)"),
+    ("A",  "C2", "C2  vs A  (XML retrieval efficiency vs full context)"),
+    ("A",  "E2", "E2  vs A  (HTML retrieval efficiency vs full context)"),
+    ("C",  "C2", "C2  vs C  (XML retrieval over XML vs full XML)"),
+    ("E",  "E2", "E2  vs E  (HTML retrieval over HTML vs full HTML)"),
+    ("A",  "B",  "B   vs A  (flat RAG vs full context, lit replication)"),
 ]
 
 
@@ -95,9 +101,12 @@ def ensure_dirs():
         DATA / "condition_B" / "chunks", DATA / "condition_B" / "embeddings",
         DATA / "condition_C",
         DATA / "condition_C2" / "nodes", DATA / "condition_C2" / "embeddings",
+        DATA / "condition_E",
+        DATA / "condition_E2" / "nodes", DATA / "condition_E2" / "embeddings",
         QUESTIONS,
         RESULTS / "condition_A", RESULTS / "condition_B",
         RESULTS / "condition_C", RESULTS / "condition_C2", RESULTS / "condition_D",
+        RESULTS / "condition_E", RESULTS / "condition_E2",
         EVAL / "scores", EVAL / "tables",
     ]:
         d.mkdir(parents=True, exist_ok=True)
@@ -285,6 +294,100 @@ def format_c2_context(retrieved: list) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ── Condition E  (Structured HTML) ──────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+
+def escape_html(text: str) -> str:
+    return (text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def build_html(conv: dict) -> str:
+    """Render conversation as well-formed XHTML-compatible HTML parseable by ET."""
+    parts = ["<html>"]
+    for s_idx, session in enumerate(conv["sessions"]):
+        date = session.get("date", f"session-{s_idx+1}")
+        parts.append(f'  <section id="s{s_idx+1}" data-date="{escape_html(str(date))}">')
+        for turn in session["turns"]:
+            speaker = escape_html(turn["speaker"])
+            ts      = turn.get("timestamp", "")
+            content = re.sub(r"<[^>]+>", "", turn["content"])
+            parts.append(f'    <div data-speaker="{speaker}" data-timestamp="{ts}">')
+            for sent in re.split(r"(?<=[.!?])\s+", content.strip()):
+                if sent.strip():
+                    parts.append(f"      <p>{escape_html(sent.strip())}</p>")
+            parts.append("    </div>")
+        parts.append("  </section>")
+    parts.append("</html>")
+    return "\n".join(parts)
+
+
+def validate_html(conv: dict, html_str: str) -> bool:
+    try:
+        root = ET.fromstring(html_str)
+    except ET.ParseError as e:
+        log(f"  HTML parse error: {e}", "ERROR")
+        return False
+    all_text = " ".join(
+        " ".join((p.text or "").split()) for p in root.iter("p")
+    )
+    for session in conv["sessions"]:
+        for turn in session["turns"]:
+            raw = re.sub(r"<[^>]+>", "", turn["content"])
+            key = " ".join(raw.split())[:30]
+            if key and key not in all_text:
+                return False
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ── Condition E2  (Hierarchical HTML Retrieval) ──────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+
+def extract_html_nodes(html_str: str) -> list:
+    root  = ET.fromstring(html_str)
+    nodes = []
+
+    def recurse(el, parent_id: int, depth: int, path: list):
+        node_id     = len(nodes)
+        direct_text = (el.text or "").strip()
+        for child in el:
+            if child.tail:
+                direct_text += " " + child.tail.strip()
+        attribs    = " ".join(f'{k}="{v}"' for k, v in el.attrib.items())
+        path_entry = (f"<{el.tag} {attribs}>").strip() if attribs else f"<{el.tag}>"
+        nodes.append({
+            "node_id":      node_id,
+            "tag":          el.tag,
+            "text_content": direct_text,
+            "full_path":    path + [path_entry],
+            "depth":        depth,
+            "parent_id":    parent_id,
+            "html_snippet": ET.tostring(el, encoding="unicode"),
+        })
+        for child in el:
+            recurse(child, node_id, depth + 1, path + [path_entry])
+
+    recurse(root, -1, 0, [])
+    return nodes
+
+
+def format_e2_context(retrieved: list) -> str:
+    parts = []
+    for i, item in enumerate(retrieved):
+        node = item["node"]
+        path = " > ".join(f"<{a['tag']}>" for a in item["ancestors"]) if item["ancestors"] else "<root>"
+        parts.append(
+            f"--- Retrieved Node {i+1} [path: {path} > <{node['tag']}>] ---\n"
+            f"{node['html_snippet']}"
+        )
+    return "\n\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # ── Load and normalize LoCoMo ────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -416,7 +519,26 @@ def phase1_build(dataset: list):
         sys.exit(1)
     log(f"  Condition C: {len(dataset)-skipped} built, {skipped} skipped — all validated")
 
-    # ── Encoder for B and C2 ──────────────────────────────────────────────
+    # ── Condition E (HTML) ───────────────────────────────────────────────
+    log("  Building Condition E (HTML + validation)...")
+    failures, skipped = [], 0
+    for conv in tqdm(dataset, desc="  Cond E", leave=False):
+        p = DATA / "condition_E" / f"{conv['conversation_id']}.html"
+        if p.exists():
+            skipped += 1
+            continue
+        html_str = build_html(conv)
+        if not validate_html(conv, html_str):
+            failures.append(conv["conversation_id"])
+            log(f"  VALIDATION FAILED (HTML): {conv['conversation_id']}", "ERROR")
+        else:
+            p.write_text(html_str)
+    if failures:
+        log(f"HTML validation failed for: {failures}", "ERROR")
+        sys.exit(1)
+    log(f"  Condition E: {len(dataset)-skipped} built, {skipped} skipped — all validated")
+
+    # ── Encoder for B, C2, E2 ────────────────────────────────────────────
     log("  Loading sentence encoder (all-MiniLM-L6-v2)...")
     encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
 
@@ -437,7 +559,7 @@ def phase1_build(dataset: list):
     log(f"  Condition B: {len(dataset)-skipped} built, {skipped} skipped")
 
     # ── Condition C2 ─────────────────────────────────────────────────────
-    log("  Building Condition C2 (hierarchical nodes + FAISS)...")
+    log("  Building Condition C2 (hierarchical XML nodes + FAISS)...")
     skipped = 0
     for conv in tqdm(dataset, desc="  Cond C2", leave=False):
         cid  = conv["conversation_id"]
@@ -453,6 +575,23 @@ def phase1_build(dataset: list):
         faiss.write_index(index, str(ip))
     log(f"  Condition C2: {len(dataset)-skipped} built, {skipped} skipped")
 
+    # ── Condition E2 ─────────────────────────────────────────────────────
+    log("  Building Condition E2 (hierarchical HTML nodes + FAISS)...")
+    skipped = 0
+    for conv in tqdm(dataset, desc="  Cond E2", leave=False):
+        cid  = conv["conversation_id"]
+        np_  = DATA / "condition_E2" / "nodes"      / f"{cid}.json"
+        ip   = DATA / "condition_E2" / "embeddings"  / f"{cid}.index"
+        if np_.exists() and ip.exists():
+            skipped += 1
+            continue
+        html_str = (DATA / "condition_E" / f"{cid}.html").read_text()
+        nodes    = extract_html_nodes(html_str)
+        index    = build_c2_index(nodes, encoder)  # same hierarchical embedding logic
+        np_.write_text(json.dumps(nodes))
+        faiss.write_index(index, str(ip))
+    log(f"  Condition E2: {len(dataset)-skipped} built, {skipped} skipped")
+
     # Summary check
     n_convs = len(dataset)
     for label, pat in [
@@ -462,6 +601,9 @@ def phase1_build(dataset: list):
         ("C",          "condition_C/*.xml"),
         ("C2 nodes",   "condition_C2/nodes/*.json"),
         ("C2 indices", "condition_C2/embeddings/*.index"),
+        ("E",          "condition_E/*.html"),
+        ("E2 nodes",   "condition_E2/nodes/*.json"),
+        ("E2 indices", "condition_E2/embeddings/*.index"),
     ]:
         n = len(list(DATA.glob(pat)))
         ok = "✓" if n == n_convs else f"WARNING {n}/{n_convs}"
@@ -483,10 +625,13 @@ def load_representations(conv_ids: list) -> dict:
         reps[cid] = {
             "linear":   (DATA / "condition_A" / f"{cid}.txt").read_text(),
             "xml":      (DATA / "condition_C" / f"{cid}.xml").read_text(),
+            "html":     (DATA / "condition_E" / f"{cid}.html").read_text(),
             "chunks":   json.loads((DATA / "condition_B" / "chunks" / f"{cid}.json").read_text()),
             "nodes":    json.loads((DATA / "condition_C2" / "nodes" / f"{cid}.json").read_text()),
+            "e2_nodes": json.loads((DATA / "condition_E2" / "nodes" / f"{cid}.json").read_text()),
             "b_index":  faiss.read_index(str(DATA / "condition_B" / "embeddings" / f"{cid}.index")),
             "c2_index": faiss.read_index(str(DATA / "condition_C2" / "embeddings" / f"{cid}.index")),
+            "e2_index": faiss.read_index(str(DATA / "condition_E2" / "embeddings" / f"{cid}.index")),
         }
     return reps
 
@@ -537,6 +682,27 @@ def assemble_prompt(cond: str, question: str, conv_id: str,
     elif cond == "D":
         prompt = (
             "You are a helpful assistant. Answer the question as best you can.\n\n"
+            f"Question: {question}\nAnswer:"
+        )
+    elif cond == "E":
+        prompt = (
+            "You are a helpful assistant. Answer the question based on "
+            "the conversation record below. The record is formatted as HTML. "
+            "Use the element hierarchy (section, div, p) and data attributes "
+            "(data-speaker, data-date) to understand the speaker, chronological, "
+            "and topical organization of the conversation.\n\n"
+            f"{rep['html']}\n\n"
+            f"Question: {question}\nAnswer:"
+        )
+    elif cond == "E2":
+        hits    = retrieve_nodes_hierarchical(question, rep["e2_nodes"], rep["e2_index"], encoder)
+        context = format_e2_context(hits)
+        prompt  = (
+            "You are a helpful assistant. Answer the question based on "
+            "the retrieved conversation nodes below. Each node is shown with "
+            "its hierarchical path (ancestors) for context, followed by its "
+            "HTML content.\n\n"
+            f"Retrieved Nodes:\n{context}\n\n"
             f"Question: {question}\nAnswer:"
         )
     else:
@@ -845,14 +1011,18 @@ def generate_llm_narrative(results_text: str, model_and_tok) -> str:
         "Conditions:\n"
         "  A  — Full conversation as plain linear text (accuracy ceiling)\n"
         "  B  — Top-5 chunks retrieved by cosine similarity (flat RAG baseline)\n"
-        "  C  — Full conversation as structured XML (tests H1: does structure alone help?)\n"
+        "  C  — Full conversation as structured XML (tests H1: does XML structure alone help?)\n"
         "  C2 — Top-5 XML nodes retrieved by hierarchical embeddings + ancestral path "
-              "(tests H2: does structured retrieval beat flat RAG?)\n"
-        "  D  — No memory, question only (floor baseline)\n\n"
+              "(tests H2: does XML-structured retrieval beat flat RAG?)\n"
+        "  D  — No memory, question only (floor baseline)\n"
+        "  E  — Full conversation as structured HTML (tests H3: does HTML structure alone help?)\n"
+        "  E2 — Top-5 HTML nodes retrieved by hierarchical embeddings + ancestral path "
+              "(tests H4: does HTML-structured retrieval beat flat RAG?)\n\n"
         "Hypotheses:\n"
-        "  H1: Hierarchical XML structure improves accuracy over flat linear text of identical content.\n"
-        "  H2: Hierarchical XML retrieval with ancestral context outperforms flat chunk RAG "
-              "at comparable token cost.\n\n"
+        "  H1: XML structure improves accuracy over flat linear text of identical content.\n"
+        "  H2: Hierarchical XML retrieval outperforms flat chunk RAG at comparable token cost.\n"
+        "  H3: HTML structure improves accuracy over flat linear text of identical content.\n"
+        "  H4: Hierarchical HTML retrieval outperforms flat chunk RAG at comparable token cost.\n\n"
         f"Experimental Results:\n{results_text}\n\n"
         "Write Section 4.1 of the paper: \"Validating the Structural Representation Hypothesis\".\n"
         "Write in the style of an ACL/EMNLP paper. Length: 450-650 words.\n\n"
@@ -892,7 +1062,7 @@ def phase5_report(df: pd.DataFrame, llm_7b=None):
         "  Benchmark : LoCoMo (locomo10.json, 10 conversations)",
         f"  QA pairs  : {n_qa} (per condition per model)",
         "  Models    : Qwen2.5-72B-Instruct, Qwen2.5-7B-Instruct",
-        "  Conditions: A (Full Linear) | B (Flat RAG) | C (Full XML) | C2 (Hier. XML Retrieval) | D (No Memory)",
+        "  Conditions: A (Full Linear) | B (Flat RAG) | C (Full XML) | C2 (Hier. XML Retrieval) | D (No Memory) | E (Full HTML) | E2 (Hier. HTML Retrieval)",
         "  Metrics   : F1, BLEU-1, ROUGE-L, ROUGE-2, METEOR, SBERT-sim",
         "",
         results_text,
