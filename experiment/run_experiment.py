@@ -557,7 +557,9 @@ def jsonl_line_count(path: Path) -> int:
 
 
 def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
-                            encoder, conditions=None):
+                            encoder, conditions=None,
+                            tensor_parallel_size=4, max_model_len=32768,
+                            gpu_memory_utilization=0.90):
     model_id   = MODEL_IDS[model_tag]
     conditions = conditions or CONDITION_ORDER
 
@@ -565,13 +567,13 @@ def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     from vllm import LLM, SamplingParams
-    log(f"  Loading vLLM model ({model_id}, tensor_parallel_size=4)...")
+    log(f"  Loading vLLM model ({model_id}, tp={tensor_parallel_size}, max_len={max_model_len})...")
     llm = LLM(
         model=model_id,
         dtype="bfloat16",
-        tensor_parallel_size=4,
-        max_model_len=32768,
-        gpu_memory_utilization=0.90,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=gpu_memory_utilization,
         enforce_eager=False,
     )
     sampling_params = SamplingParams(
@@ -920,9 +922,26 @@ def phase5_report(df: pd.DataFrame, llm_7b=None):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gpu", choices=["h200x4", "a100x2"], default="h200x4",
+                        help="GPU profile: h200x4 (default) or a100x2")
+    args_cli = parser.parse_args()
+
+    # GPU profiles
+    if args_cli.gpu == "a100x2":
+        TP   = 2
+        MLEN = 16384   # 72B fits in 2×80GB but needs reduced context
+        MEM  = 0.95
+    else:
+        TP   = 4
+        MLEN = 32768
+        MEM  = 0.90
+
     t_start = time.perf_counter()
     log("EngramTrace Concept Verification Experiment — starting")
     log(f"Base directory: {BASE}")
+    log(f"GPU profile   : {args_cli.gpu}  (tp={TP}, max_model_len={MLEN})")
 
     ensure_dirs()
 
@@ -948,14 +967,20 @@ def main():
     log("═" * 60)
     log("PHASE 2 — Inference (Qwen2.5-72B-Instruct)")
     log("═" * 60)
-    llm_72b = run_inference_for_model("72B", qa_pairs, reps, encoder)
+    llm_72b = run_inference_for_model("72B", qa_pairs, reps, encoder,
+                                      tensor_parallel_size=TP,
+                                      max_model_len=MLEN,
+                                      gpu_memory_utilization=MEM)
     unload_llm(llm_72b)
 
     # ── Phase 3: Inference — 7B ──────────────────────────────────────────
     log("═" * 60)
     log("PHASE 3 — Inference (Qwen2.5-7B-Instruct)")
     log("═" * 60)
-    llm_7b = run_inference_for_model("7B", qa_pairs, reps, encoder)
+    llm_7b = run_inference_for_model("7B", qa_pairs, reps, encoder,
+                                     tensor_parallel_size=TP,
+                                     max_model_len=MLEN,
+                                     gpu_memory_utilization=MEM)
 
     del encoder, reps
     gc.collect()
