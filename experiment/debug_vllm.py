@@ -101,21 +101,22 @@ if __name__ == '__main__':
         traceback.print_exc()
         sys.exit(1)
 
-    # ── 7. LLM init — 4 GPU ──────────────────────────────────────────────────
-    section("7. LLM init (tensor_parallel_size=4, bfloat16)")
+    # ── 7. LLM init — 2 GPU (A100×2) ────────────────────────────────────────
+    section("7. LLM init (tensor_parallel_size=2, bfloat16, mp backend)")
     llm = None
     try:
         llm = LLM(
             model=MODEL,
             dtype="bfloat16",
-            tensor_parallel_size=4,
+            tensor_parallel_size=2,
             max_model_len=4096,
             gpu_memory_utilization=0.80,
             enforce_eager=False,
+            distributed_executor_backend="mp",  # avoid Ray
         )
-        print("  OK: LLM initialized with 4 GPUs")
+        print("  OK: LLM initialized with 2 GPUs")
     except Exception:
-        print("  [ERROR] 4-GPU LLM init failed:")
+        print("  [ERROR] 2-GPU LLM init failed:")
         traceback.print_exc()
 
     # ── 7b. Fallback — 1 GPU ─────────────────────────────────────────────────
@@ -129,6 +130,7 @@ if __name__ == '__main__':
                 max_model_len=4096,
                 gpu_memory_utilization=0.80,
                 enforce_eager=True,
+                distributed_executor_backend="mp",
             )
             print("  OK: LLM initialized (single GPU, eager)")
         except Exception:

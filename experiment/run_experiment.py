@@ -575,6 +575,7 @@ def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
         max_model_len=max_model_len,
         gpu_memory_utilization=gpu_memory_utilization,
         enforce_eager=False,
+        distributed_executor_backend="mp",
     )
     sampling_params = SamplingParams(
         temperature=0.0,
