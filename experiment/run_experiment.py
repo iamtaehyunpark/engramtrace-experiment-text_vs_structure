@@ -941,6 +941,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpu", choices=["h200x4", "a100x2", "a100x8", "a6000x4"], default="h200x4",
                         help="GPU profile: h200x4 (default) or a100x2")
+    parser.add_argument("--models", nargs="+", choices=["72B", "7B"], default=["72B", "7B"],
+                        help="Which models to run (default: both)")
     args_cli = parser.parse_args()
 
     # GPU profiles
@@ -983,21 +985,24 @@ def main():
     reps    = load_representations(conv_ids)
 
     # ── Phase 2: Inference — 72B ─────────────────────────────────────────
-    log("═" * 60)
-    log("PHASE 2 — Inference (Qwen2.5-72B-Instruct)")
-    log("═" * 60)
-    llm_72b = run_inference_for_model("72B", qa_pairs, reps, encoder,
-                                      tensor_parallel_size=TP,
-                                      gpu_memory_utilization=MEM)
-    unload_llm(llm_72b)
+    llm_7b = None
+    if "72B" in args_cli.models:
+        log("═" * 60)
+        log("PHASE 2 — Inference (Qwen2.5-72B-Instruct)")
+        log("═" * 60)
+        llm_72b = run_inference_for_model("72B", qa_pairs, reps, encoder,
+                                          tensor_parallel_size=TP,
+                                          gpu_memory_utilization=MEM)
+        unload_llm(llm_72b)
 
     # ── Phase 3: Inference — 7B ──────────────────────────────────────────
-    log("═" * 60)
-    log("PHASE 3 — Inference (Qwen2.5-7B-Instruct)")
-    log("═" * 60)
-    llm_7b = run_inference_for_model("7B", qa_pairs, reps, encoder,
-                                     tensor_parallel_size=TP,
-                                     gpu_memory_utilization=MEM)
+    if "7B" in args_cli.models:
+        log("═" * 60)
+        log("PHASE 3 — Inference (Qwen2.5-7B-Instruct)")
+        log("═" * 60)
+        llm_7b = run_inference_for_model("7B", qa_pairs, reps, encoder,
+                                         tensor_parallel_size=TP,
+                                         gpu_memory_utilization=MEM)
 
     del encoder, reps
     gc.collect()
