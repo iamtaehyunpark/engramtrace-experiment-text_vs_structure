@@ -492,7 +492,8 @@ def load_representations(conv_ids: list) -> dict:
 
 
 def assemble_prompt(cond: str, question: str, conv_id: str,
-                    reps: dict, encoder, tokenizer) -> dict:
+                    reps: dict, encoder, tokenizer,
+                    max_input_tokens: int = None) -> dict:
     rep = reps[conv_id]
     if cond == "A":
         prompt = (
@@ -541,11 +542,9 @@ def assemble_prompt(cond: str, question: str, conv_id: str,
     else:
         raise ValueError(f"Unknown condition: {cond}")
 
-    # Truncate if prompt exceeds model's context limit (leave 256 tokens for output)
-    max_input = tokenizer.model_max_length - 256
     ids = tokenizer.encode(prompt, add_special_tokens=False)
-    if len(ids) > max_input:
-        ids = ids[:max_input]
+    if max_input_tokens and len(ids) > max_input_tokens:
+        ids = ids[:max_input_tokens]
         prompt = tokenizer.decode(ids, skip_special_tokens=True)
 
     return {
@@ -589,6 +588,8 @@ def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
         max_tokens=256,
         stop=["\n\nQuestion:", "\n\nAnswer:"],
     )
+    max_input_tokens = llm.llm_engine.model_config.max_model_len - 256
+    log(f"  Max input tokens: {max_input_tokens}")
 
     for cond in conditions:
         out_path = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
@@ -600,7 +601,7 @@ def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
         assembled = [
             {"qa": qa,
              **assemble_prompt(cond, qa["question"], qa["conversation_id"],
-                               reps, encoder, tokenizer)}
+                               reps, encoder, tokenizer, max_input_tokens)}
             for qa in tqdm(qa_pairs, desc=f"  Prompts {cond}", leave=False)
         ]
 
