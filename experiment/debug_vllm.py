@@ -138,18 +138,54 @@ if __name__ == '__main__':
             traceback.print_exc()
             sys.exit(1)
 
-    # ── 8. Generate ──────────────────────────────────────────────────────────
-    section("8. Test generation")
+    # ── 8. Generate (7B) ─────────────────────────────────────────────────────
+    section("8. Test generation (7B)")
     try:
         sp = SamplingParams(temperature=0.0, max_tokens=64)
         prompt = "What is 2 + 2? Answer in one sentence."
         print(f"  Prompt: {prompt!r}")
         outputs = llm.generate([prompt], sp)
         print(f"  Response: {outputs[0].outputs[0].text.strip()!r}")
-        print("  OK: generation successful")
+        print("  OK")
     except Exception:
         print("  [FATAL] generate failed:")
         traceback.print_exc()
         sys.exit(1)
 
-    section("DONE — all checks passed")
+    # ── 9. 72B LLM init ──────────────────────────────────────────────────────
+    section("9. LLM init 72B (tensor_parallel_size=2, bfloat16)")
+    del llm
+    import gc, torch
+    gc.collect()
+    torch.cuda.empty_cache()
+    MODEL_72B = "Qwen/Qwen2.5-72B-Instruct"
+    llm_72b = None
+    try:
+        llm_72b = LLM(
+            model=MODEL_72B,
+            dtype="bfloat16",
+            tensor_parallel_size=2,
+            max_model_len=4096,
+            gpu_memory_utilization=0.95,
+            enforce_eager=False,
+            distributed_executor_backend="mp",
+        )
+        print("  OK: 72B initialized with 2 GPUs")
+    except Exception:
+        print("  [ERROR] 72B init failed:")
+        traceback.print_exc()
+
+    # ── 10. Generate (72B) ───────────────────────────────────────────────────
+    if llm_72b is not None:
+        section("10. Test generation (72B)")
+        try:
+            sp = SamplingParams(temperature=0.0, max_tokens=64)
+            prompt = "What is 2 + 2? Answer in one sentence."
+            outputs = llm_72b.generate([prompt], sp)
+            print(f"  Response: {outputs[0].outputs[0].text.strip()!r}")
+            print("  OK")
+        except Exception:
+            print("  [FATAL] 72B generate failed:")
+            traceback.print_exc()
+
+    section("DONE")
