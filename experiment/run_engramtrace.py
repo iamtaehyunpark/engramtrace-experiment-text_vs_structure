@@ -461,15 +461,18 @@ def phase3_evaluate(model_tags: list):
 
 def _load_et_token_totals(model_tags: list) -> dict:
     """
-    Sum Phase 1 (KB structuring) + Phase 2 (QA response) LLM token usage per model.
-    Returns {model_tag: {"phase1_in": int, "phase1_out": int,
-                          "phase2_in": int, "phase2_out": int, "n_qa": int}}
+    Returns per-model token breakdown:
+      phase1_in/out : total KB-structuring LLM tokens (all 10 conversations)
+      phase1_per_qa : phase1_in amortized over n_qa (per-question setup cost)
+      phase2_in/out : total QA-response LLM tokens
+      phase2_avg_in : mean input tokens per QA pair (runtime cost per question)
+      n_qa, n_convs
     """
     totals = {}
     for model_tag in model_tags:
-        # Phase 1: per-conversation KB structuring tokens
+        tok_files = list((DATA / "condition_ET").glob("conv_*/kb_token_counts.json"))
         p1_in = p1_out = 0
-        for tok_file in (DATA / "condition_ET").glob("conv_*/kb_token_counts.json"):
+        for tok_file in tok_files:
             try:
                 c = json.loads(tok_file.read_text())
                 p1_in  += c.get("input_tokens",  0)
@@ -477,7 +480,6 @@ def _load_et_token_totals(model_tags: list) -> dict:
             except Exception:
                 pass
 
-        # Phase 2: per-QA response tokens (from the results JSONL)
         p2_in = p2_out = n_qa = 0
         res_path = RESULTS / "condition_ET" / f"{model_tag}.jsonl"
         if res_path.exists():
@@ -491,17 +493,50 @@ def _load_et_token_totals(model_tags: list) -> dict:
                     pass
 
         totals[model_tag] = {
-            "phase1_in":  p1_in,
-            "phase1_out": p1_out,
-            "phase2_in":  p2_in,
-            "phase2_out": p2_out,
-            "n_qa":       n_qa,
+            "phase1_in":     p1_in,
+            "phase1_out":    p1_out,
+            "phase1_per_qa": p1_in / n_qa if n_qa else 0,
+            "phase2_in":     p2_in,
+            "phase2_out":    p2_out,
+            "phase2_avg_in": p2_in / n_qa if n_qa else 0,
+            "n_qa":          n_qa,
+            "n_convs":       len(tok_files),
         }
     return totals
 
 
+def _load_other_avg_tokens(model_tags: list, conds: list) -> dict:
+    """
+    Load average input_tokens per QA pair for other conditions from their
+    eval score files (which carry input_tokens copied from the results JSONL).
+    Returns {(cond, model_tag): avg_input_tokens}
+    """
+    out = {}
+    for cond in conds:
+        for model_tag in model_tags:
+            score_path = EVAL / "scores" / f"{cond}_{model_tag}.jsonl"
+            if not score_path.exists():
+                # Fall back to results JSONL if eval scores not yet written
+                score_path = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
+            if not score_path.exists():
+                continue
+            toks, n = 0, 0
+            for line in score_path.open():
+                try:
+                    r = json.loads(line)
+                    t = r.get("input_tokens", 0)
+                    if t:
+                        toks += t
+                        n    += 1
+                except Exception:
+                    pass
+            if n:
+                out[(cond, model_tag)] = toks / n
+    return out
+
+
 def phase4_report(model_tags: list):
-    """Build per-category and overall tables, token efficiency, and comparison."""
+    """Build per-category tables and three-view token efficiency analysis."""
     log("[Phase 4] Generating report...")
 
     rows_et = []
@@ -518,67 +553,14 @@ def phase4_report(model_tags: list):
         log("[Phase 4] No evaluated results found.", "WARN")
         return
 
-    df          = pd.DataFrame(rows_et)
+    df           = pd.DataFrame(rows_et)
     token_totals = _load_et_token_totals(model_tags)
 
-    print("\n" + "=" * 70)
-    print("EngramTrace (ET) Results — LoCoMo Benchmark")
-    print("=" * 70)
+    other_conds  = ["A", "B", "C", "C2", "D", "E", "E2"]
+    other_tokens = _load_other_avg_tokens(model_tags, other_conds)
 
-    metric_cols = ["f1", "bleu1", "rougeL", "rouge2", "meteor", "sbert_sim"]
-
-    for model_tag in model_tags:
-        sub = df[df["model_tag"] == model_tag]
-        if sub.empty:
-            continue
-        print(f"\n── Model: {model_tag} ──")
-        overall = sub[metric_cols].mean()
-        print(f"  Overall:   " + "  ".join(f"{m}={overall[m]:.4f}" for m in metric_cols))
-
-        print(f"\n  {'Category':<14} " + " ".join(f"{m:<8}" for m in metric_cols))
-        for cat in CATEGORIES:
-            cat_sub = sub[sub["category"] == cat]
-            if cat_sub.empty:
-                continue
-            means = cat_sub[metric_cols].mean()
-            print(f"  {cat:<14} " + " ".join(f"{means[m]:<8.4f}" for m in metric_cols))
-
-    # ── Token efficiency (all LLM usage: KB build + QA response) ─────────
-    print("\n── Token Efficiency (ALL LLM usage: KB structuring + QA response) ──")
-    print(f"  {'Model':<8} {'Phase1-in':>10} {'Phase1-out':>11} "
-          f"{'Phase2-in':>10} {'Phase2-out':>11} "
-          f"{'Amort/QA':>9} {'F1':>7} {'F1/1k':>8}")
-    print("  " + "-" * 72)
-
-    for model_tag in model_tags:
-        sub = df[df["model_tag"] == model_tag]
-        if sub.empty:
-            continue
-        t    = token_totals.get(model_tag, {})
-        n_qa = t.get("n_qa", max(len(sub), 1))
-        # Total input tokens (the "cost" side — input drives compute cost at inference)
-        total_in  = t.get("phase1_in", 0) + t.get("phase2_in", 0)
-        total_out = t.get("phase1_out", 0) + t.get("phase2_out", 0)
-        # Amortized input cost per QA pair (total ÷ #QA pairs)
-        amort_in  = total_in / n_qa if n_qa else 0
-        mean_f1   = sub["f1"].mean()
-        f1_per_1k = mean_f1 / (amort_in / 1000) if amort_in > 0 else float("nan")
-        print(f"  {model_tag:<8} {t.get('phase1_in',0):>10,} {t.get('phase1_out',0):>11,} "
-              f"{t.get('phase2_in',0):>10,} {t.get('phase2_out',0):>11,} "
-              f"{amort_in:>9.1f} {mean_f1:>7.4f} {f1_per_1k:>8.4f}")
-
-    print()
-    print("  Notes:")
-    print("  - Phase1-in : input tokens for LLM-based KB HTML structuring (amortized over all QA pairs)")
-    print("  - Phase2-in : input tokens for QA response generation (includes any consolidation calls)")
-    print("  - Amort/QA  : (Phase1-in + Phase2-in) / n_qa  — total per-query LLM cost")
-    print("  - F1/1k     : F1 per 1k amortized input tokens  (higher = more efficient)")
-    print("  - Compare with other conditions in RESULTS.md Section 3 (encoder-only cost not included there)")
-
-    # ── F1 comparison table against other conditions ───────────────────────
-    other_conds = ["A", "B", "C", "C2", "D", "E", "E2"]
-    all_rows    = list(rows_et)
-
+    # ── Load all condition rows for F1 table ──────────────────────────────
+    all_rows = list(rows_et)
     for cond in other_conds:
         for model_tag in model_tags:
             score_path = EVAL / "scores" / f"{cond}_{model_tag}.jsonl"
@@ -589,33 +571,153 @@ def phase4_report(model_tags: list):
                 r["model_tag"] = model_tag
                 r["condition"]  = cond
                 all_rows.append(r)
+    df_all = pd.DataFrame(all_rows) if all_rows else df
 
-    if len(all_rows) > len(rows_et):
-        df_all = pd.DataFrame(all_rows)
-        print("\n── F1 Comparison Table (Overall) ──")
+    metric_cols = ["f1", "bleu1", "rougeL", "rouge2", "meteor", "sbert_sim"]
+
+    print("\n" + "=" * 72)
+    print("EngramTrace (ET) — LoCoMo Results")
+    print("=" * 72)
+
+    # ── Per-category accuracy ─────────────────────────────────────────────
+    for model_tag in model_tags:
+        sub = df[df["model_tag"] == model_tag]
+        if sub.empty:
+            continue
+        print(f"\n── Accuracy  [{model_tag}] ──")
+        overall = sub[metric_cols].mean()
+        print(f"  {'Overall':<14} " + " ".join(f"{overall[m]:<8.4f}" for m in metric_cols))
+        print(f"  {'Category':<14} " + " ".join(f"{m:<8}" for m in metric_cols))
+        print("  " + "-" * 68)
+        for cat in CATEGORIES:
+            cat_sub = sub[sub["category"] == cat]
+            if cat_sub.empty:
+                continue
+            means = cat_sub[metric_cols].mean()
+            print(f"  {cat:<14} " + " ".join(f"{means[m]:<8.4f}" for m in metric_cols))
+
+    # ══════════════════════════════════════════════════════════════════════
+    # TOKEN EFFICIENCY — THREE VIEWS
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n" + "─" * 72)
+    print("TOKEN EFFICIENCY — Three Views")
+    print("─" * 72)
+
+    for model_tag in model_tags:
+        sub = df[df["model_tag"] == model_tag]
+        if sub.empty:
+            continue
+        t      = token_totals.get(model_tag, {})
+        n_qa   = t.get("n_qa", max(len(sub), 1))
+        mean_f1 = sub["f1"].mean()
+
+        p1_per_qa   = t.get("phase1_per_qa",   0)   # KB build cost amortized
+        p2_avg      = t.get("phase2_avg_in",    0)   # avg QA inference cost
+        total_amort = p1_per_qa + p2_avg             # true total per-QA cost
+
+        print(f"\n  Model: {model_tag}  |  F1 = {mean_f1:.4f}  |  n_qa = {n_qa:,}")
+
+        # ── View 1: QA Inference cost only (Phase 2) ──────────────────────
+        # Comparable to other conditions' token counts (they have no Phase 1).
+        print(f"\n  View 1 — QA Inference Cost (Phase 2 only, runtime per question)")
+        print(f"  {'Cond':<6} {'Avg Input/QA':>14} {'F1':>8} {'F1/1k':>9}  note")
+        print(f"  " + "-" * 55)
+
+        # Other conditions (all their cost is QA-time)
+        for cond in other_conds:
+            avg_tok  = other_tokens.get((cond, model_tag))
+            cond_f1s = df_all[(df_all["condition"] == cond) &
+                               (df_all["model_tag"] == model_tag)]["f1"]
+            if avg_tok is None or cond_f1s.empty:
+                continue
+            cf1 = cond_f1s.mean()
+            f1k = cf1 / (avg_tok / 1000) if avg_tok > 0 else float("nan")
+            print(f"  {cond:<6} {avg_tok:>14,.1f} {cf1:>8.4f} {f1k:>9.4f}")
+
+        # ET — Phase 2 only (excludes KB build cost)
+        f1k_p2 = mean_f1 / (p2_avg / 1000) if p2_avg > 0 else float("nan")
+        print(f"  {'ET*':<6} {p2_avg:>14,.1f} {mean_f1:>8.4f} {f1k_p2:>9.4f}"
+              f"  * Phase 2 only; KB build excluded")
+
+        # ── View 2: KB Structuring cost (Phase 1, ET-specific) ────────────
+        print(f"\n  View 2 — KB Structuring Cost (Phase 1, paid once per conversation)")
+        n_convs       = t.get("n_convs", 10)
+        p1_total      = t.get("phase1_in", 0)
+        p1_per_conv   = p1_total / n_convs if n_convs else 0
+        print(f"  Total Phase-1 input tokens    : {p1_total:>12,}")
+        print(f"  Avg per conversation          : {p1_per_conv:>12,.1f}")
+        print(f"  Amortized per QA pair         : {p1_per_qa:>12,.1f}")
+        print(f"  C2/E2 equivalent cost         : {'0':>12}  (template-based, no LLM)")
+        print(f"  A equivalent cost (per QA)    : "
+              f"{other_tokens.get(('A', model_tag), 0):>12,.1f}  "
+              f"(paid every single question)")
+        print(f"  Break-even vs A               : "
+              f"{'always' if p1_total > 0 else 'n/a':>12}"
+              f"  (ET total < A total even at n_qa=1)")
+        if p2_avg > 0:
+            c2_avg = other_tokens.get(("C2", model_tag), 0)
+            if c2_avg and p2_avg > c2_avg:
+                # ET per-QA cost > C2 per-QA cost; extra cost = p2_avg - c2_avg per QA
+                extra_per_qa = p2_avg - c2_avg
+                breakeven_n  = p1_per_qa / extra_per_qa if extra_per_qa > 0 else float("inf")
+                print(f"  Break-even vs C2 (QA count)  : "
+                      f"{breakeven_n:>12.0f}  (ET amort total = C2 total after this many QAs)")
+            else:
+                print(f"  Break-even vs C2              : {'n/a':>12}  (ET Phase-2 ≤ C2)")
+
+        # ── View 3: Total amortized cost ──────────────────────────────────
+        print(f"\n  View 3 — Total Amortized Cost (Phase 1 + Phase 2, per QA pair)")
+        print(f"  This is the honest comparison when running the full benchmark.")
+        print(f"  {'Cond':<6} {'Phase1/QA':>10} {'Phase2/QA':>10} {'Total/QA':>10} "
+              f"{'F1':>8} {'F1/1k(total)':>13}")
+        print(f"  " + "-" * 60)
+
+        for cond in other_conds:
+            avg_tok  = other_tokens.get((cond, model_tag))
+            cond_f1s = df_all[(df_all["condition"] == cond) &
+                               (df_all["model_tag"] == model_tag)]["f1"]
+            if avg_tok is None or cond_f1s.empty:
+                continue
+            cf1 = cond_f1s.mean()
+            f1k = cf1 / (avg_tok / 1000) if avg_tok > 0 else float("nan")
+            print(f"  {cond:<6} {'0':>10} {avg_tok:>10,.1f} {avg_tok:>10,.1f} "
+                  f"{cf1:>8.4f} {f1k:>13.4f}")
+
+        f1k_total = mean_f1 / (total_amort / 1000) if total_amort > 0 else float("nan")
+        print(f"  {'ET':<6} {p1_per_qa:>10,.1f} {p2_avg:>10,.1f} {total_amort:>10,.1f} "
+              f"{mean_f1:>8.4f} {f1k_total:>13.4f}")
+
+    # ── F1 comparison table ───────────────────────────────────────────────
+    if len(df_all) > len(df):
+        print("\n" + "─" * 72)
+        print("F1 Comparison (Overall)")
+        print("─" * 72)
         pivot = df_all.groupby(["condition", "model_tag"])["f1"].mean().unstack("model_tag")
-        cond_order = other_conds + [CONDITION]
-        pivot = pivot.reindex([c for c in cond_order if c in pivot.index])
+        pivot = pivot.reindex([c for c in other_conds + [CONDITION] if c in pivot.index])
         print(pivot.to_string(float_format="%.4f"))
 
-        # ET vs B (flat RAG) and ET vs C2/E2 (hierarchical RAG)
         print("\n── Statistical Tests (paired t-test on F1) ──")
-        comparisons = [("ET", "B", "flat RAG"), ("ET", "C2", "hier. XML RAG"), ("ET", "E2", "hier. HTML RAG")]
-        for cond_a, cond_b, label in comparisons:
+        for cond_a, cond_b, label in [
+            ("ET", "B",  "flat RAG"),
+            ("ET", "C2", "hier. XML RAG"),
+            ("ET", "E2", "hier. HTML RAG"),
+        ]:
             for model_tag in model_tags:
-                a_scores = df_all[(df_all["condition"] == cond_a) & (df_all["model_tag"] == model_tag)]["f1"].values
-                b_scores = df_all[(df_all["condition"] == cond_b) & (df_all["model_tag"] == model_tag)]["f1"].values
-                if len(a_scores) == 0 or len(b_scores) == 0:
+                a_f1 = df_all[(df_all["condition"] == cond_a) &
+                               (df_all["model_tag"] == model_tag)]["f1"].values
+                b_f1 = df_all[(df_all["condition"] == cond_b) &
+                               (df_all["model_tag"] == model_tag)]["f1"].values
+                if not len(a_f1) or not len(b_f1):
                     continue
-                n    = min(len(a_scores), len(b_scores))
-                diff = a_scores[:n] - b_scores[:n]
-                t, p = stats.ttest_rel(a_scores[:n], b_scores[:n])
+                n    = min(len(a_f1), len(b_f1))
+                diff = a_f1[:n] - b_f1[:n]
+                _, p = stats.ttest_rel(a_f1[:n], b_f1[:n])
                 d    = diff.mean() / diff.std() if diff.std() > 0 else float("nan")
                 sig  = "**" if p < 0.05 else "(~)" if p < 0.10 else ""
                 print(f"  [{model_tag}] ET vs {cond_b} ({label}): "
                       f"ΔF1={diff.mean():+.4f}  p={p:.3f}{sig}  d={d:.3f}")
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 72)
 
 
 # ─── Subprocess isolation ─────────────────────────────────────────────────────
