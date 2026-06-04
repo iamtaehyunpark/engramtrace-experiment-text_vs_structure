@@ -1298,6 +1298,18 @@ def main():
     encoder = SentenceTransformer(ENCODER_MODEL, device="cpu")
     reps    = load_representations(conv_ids)
 
+    # ── Phase 1b: α/k retrieval ablation (CPU-only) ──────────────────────
+    log("═" * 60)
+    log("PHASE 1b — α/k retrieval ablation (C2 and E2)")
+    log("═" * 60)
+    import subprocess
+    ablation_script = BASE / "ablation_retrieval.py"
+    ablation_out    = EVAL / "tables" / "ablation_retrieval.csv"
+    subprocess.run(
+        [sys.executable, str(ablation_script), "--output", str(ablation_out)],
+        check=False,
+    )
+
     # ── Phase 2: Inference — 72B ─────────────────────────────────────────
     llm_7b = None
     if "72B" in args_cli.models:
