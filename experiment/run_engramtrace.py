@@ -149,7 +149,19 @@ def load_dataset():
     raw_path = DATA / "raw" / "locomo10.json"
     with open(raw_path) as f:
         raw = json.load(f)
-    return list(raw.values()) if isinstance(raw, dict) else raw
+    if isinstance(raw, dict):
+        dataset = []
+        for key, conv in raw.items():
+            if not isinstance(conv, dict):
+                continue
+            conv = dict(conv)
+            # LoCoMo stores the ID as the dict key, not as a field inside the value.
+            # Inject it so phase1_build_kbs and phase2_qa_inference use consistent paths.
+            if not conv.get("conversation_id"):
+                conv["conversation_id"] = key
+            dataset.append(conv)
+        return dataset
+    return raw
 
 
 def build_session_text(session: dict) -> str:
@@ -249,6 +261,9 @@ def phase1_build_kbs(client, dataset: list):
         )
 
         raw_text = build_conversation_text(conv)
+        if len(raw_text.split()) < 50:
+            log(f"  conv_{cid}: WARNING — conversation text is only {len(raw_text.split())} words. "
+                f"Sessions key present: {'sessions' in conv}. Keys: {list(conv.keys())[:6]}", "WARN")
         client.reset_token_counts()
         try:
             active_ids = mem.atomizer(client, raw_text=raw_text)
