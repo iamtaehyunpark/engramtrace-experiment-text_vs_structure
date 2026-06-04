@@ -773,11 +773,13 @@ def jsonl_line_count(path: Path) -> int:
 
 
 def _valid_tp(model_tag: str, requested: int) -> int:
-    """Return the largest tp ≤ requested that evenly divides this model's attention heads."""
-    num_heads = {"72B": 64, "7B": 28}
+    """Return largest tp ≤ requested that evenly divides both attention heads AND vocab size."""
+    num_heads  = {"72B": 64,     "7B": 28}
+    vocab_size = {"72B": 152064, "7B": 152064}  # padded vocab for Qwen2.5 family
     heads = num_heads.get(model_tag, requested)
+    vocab = vocab_size.get(model_tag, 152064)
     tp = requested
-    while tp > 1 and heads % tp != 0:
+    while tp > 1 and (heads % tp != 0 or vocab % tp != 0):
         tp -= 1
     return tp
 
