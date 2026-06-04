@@ -1318,17 +1318,6 @@ def main():
     qa_pairs = [json.loads(l) for l in qa_path.open()]
     log(f"QA pairs: {len(qa_pairs)}")
 
-    # ── Phase 1b: α/k retrieval ablation (CPU-only) ──────────────────────
-    log("═" * 60)
-    log("PHASE 1b — α/k retrieval ablation (C2 and E2)")
-    log("═" * 60)
-    ablation_out = EVAL / "tables" / "ablation_retrieval.csv"
-    _sp.run(
-        [sys.executable, str(BASE / "ablation_retrieval.py"),
-         "--output", str(ablation_out)],
-        check=False,
-    )
-
     # ── Phase 2 & 3: Inference — each model in its own subprocess ────────
     # vLLM worker processes hold the CUDA context until the OS process exits.
     # Running both models in one process causes OOM on the second load.
