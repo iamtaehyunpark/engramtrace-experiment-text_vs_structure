@@ -1237,8 +1237,8 @@ def phase5_report(df: pd.DataFrame, llm_7b=None):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu", choices=["h200x4", "a100x2", "a100x6", "a100x8", "a6000x4"], default="h200x4",
-                        help="GPU profile: h200x4 (default), a100x2, a100x6, a100x8, a6000x4")
+    parser.add_argument("--gpu", choices=["h200x4", "a100x2", "a100x4", "a100x8", "a6000x4"], default="h200x4",
+                        help="GPU profile: h200x4 (default), a100x2, a100x4, a100x8, a6000x4")
     parser.add_argument("--models", nargs="+", choices=["72B", "7B"], default=["72B", "7B"],
                         help="Which models to run (default: both)")
     parser.add_argument("--rebuild", action="store_true",
@@ -1253,8 +1253,8 @@ def main():
     if args_cli.gpu == "a100x8":
         TP  = 8
         MEM = 0.90
-    elif args_cli.gpu == "a100x6":
-        TP  = 6
+    elif args_cli.gpu == "a100x4":
+        TP  = 4
         MEM = 0.90
     elif args_cli.gpu == "a100x2":
         TP  = 2
