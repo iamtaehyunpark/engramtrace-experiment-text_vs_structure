@@ -122,7 +122,7 @@ def download_data():
     # Normalise per-conversation QA
     qa_pairs = []
     for conv in dataset:
-        cid = conv.get("conversation_id", conv.get("id", "unknown"))
+        cid = conv.get("conversation_id") or conv.get("sample_id") or conv.get("id", "unknown")
         for qa in conv.get("qa", []):
             cat_raw = qa.get("type") or qa.get("category") or 1
             cat     = CATEGORY_MAP.get(int(cat_raw), "single_hop") if str(cat_raw).isdigit() else str(cat_raw)
@@ -145,43 +145,105 @@ def load_qa_pairs():
     return [json.loads(l) for l in (QUESTIONS / "locomo_qa.jsonl").open()]
 
 
+def _cid(conv: dict) -> str:
+    """Return a stable conversation ID from whichever field is present."""
+    return (conv.get("conversation_id")
+            or conv.get("sample_id")
+            or conv.get("id")
+            or "unknown")
+
+
 def load_dataset():
     raw_path = DATA / "raw" / "locomo10.json"
     with open(raw_path) as f:
         raw = json.load(f)
+
+    # Normalise: ensure every entry carries conversation_id regardless of source format.
     if isinstance(raw, dict):
+        # Format A: {"conv-26": {...}, ...} — ID is the dict key
         dataset = []
         for key, conv in raw.items():
             if not isinstance(conv, dict):
                 continue
             conv = dict(conv)
-            # LoCoMo stores the ID as the dict key, not as a field inside the value.
-            # Inject it so phase1_build_kbs and phase2_qa_inference use consistent paths.
-            if not conv.get("conversation_id"):
-                conv["conversation_id"] = key
+            conv["conversation_id"] = conv.get("conversation_id") or conv.get("sample_id") or key
             dataset.append(conv)
         return dataset
-    return raw
 
-
-def build_session_text(session: dict) -> str:
-    """Concatenates a single session's turns into plain text for the atomizer."""
-    date    = session.get("date", "Unknown date")
-    lines   = [f"=== Session on {date} ==="]
-    for turn in session.get("turns", []):
-        speaker = turn.get("speaker", "?")
-        ts      = turn.get("timestamp", "")
-        content = re.sub(r"<[^>]+>", "", turn.get("content", ""))
-        lines.append(f"[{speaker}, {ts}]: {content}")
-    return "\n".join(lines)
+    # Format B: [{sample_id: "conv-26", conversation: [...], ...}, ...]
+    dataset = []
+    for conv in raw:
+        if isinstance(conv, dict):
+            conv = dict(conv)
+            conv["conversation_id"] = _cid(conv)
+            dataset.append(conv)
+    return dataset
 
 
 def build_conversation_text(conversation: dict) -> str:
-    """Joins all sessions of a conversation into one text blob."""
-    parts = []
-    for session in conversation.get("sessions", []):
-        parts.append(build_session_text(session))
-    return "\n\n".join(parts)
+    """
+    Convert a LoCoMo conversation dict into plain text for the atomizer.
+    Handles two formats:
+      A. sessions-list format: {sessions: [{date, turns: [{speaker, content}]}]}
+      B. native LoCoMo format: {conversation: [{session, speaker, text, timestamp}]}
+    """
+    # Format A: sessions list
+    sessions = conversation.get("sessions", [])
+    if sessions and isinstance(sessions, list):
+        parts = []
+        for session in sessions:
+            date  = session.get("date", "")
+            lines = [f"=== Session{(' on ' + date) if date else ''} ==="]
+            for turn in session.get("turns", []):
+                speaker = turn.get("speaker", "?")
+                ts      = turn.get("timestamp", "")
+                content = re.sub(r"<[^>]+>", "", turn.get("content", ""))
+                lines.append(f"[{speaker}{(', ' + ts) if ts else ''}]: {content}")
+            parts.append("\n".join(lines))
+        return "\n\n".join(parts)
+
+    # Format B: flat turn list under "conversation" key, grouped by session number
+    turns_raw = conversation.get("conversation", [])
+    if not turns_raw:
+        return ""
+
+    if isinstance(turns_raw, list):
+        # Group by session field
+        sessions_dict: dict = {}
+        for turn in turns_raw:
+            sess = str(turn.get("session", turn.get("session_id", "1")))
+            sessions_dict.setdefault(sess, []).append(turn)
+
+        parts = []
+        for sess_id in sorted(sessions_dict, key=lambda x: int(x) if x.isdigit() else x):
+            lines = [f"=== Session {sess_id} ==="]
+            for turn in sessions_dict[sess_id]:
+                speaker = turn.get("speaker", "?")
+                text    = re.sub(r"<[^>]+>", "",
+                                 turn.get("text", turn.get("utterance",
+                                          turn.get("content", ""))))
+                ts      = turn.get("timestamp", "")
+                lines.append(f"[{speaker}{(', ' + ts) if ts else ''}]: {text}")
+            parts.append("\n".join(lines))
+        return "\n\n".join(parts)
+
+    if isinstance(turns_raw, dict):
+        # {session_id: {date, turns: [...]}} format
+        parts = []
+        for sess_id, sess_data in sorted(turns_raw.items()):
+            if not isinstance(sess_data, dict):
+                continue
+            date  = sess_data.get("date", "")
+            lines = [f"=== Session {sess_id}{(' on ' + date) if date else ''} ==="]
+            for turn in sess_data.get("turns", sess_data.get("conversation", [])):
+                speaker = turn.get("speaker", "?")
+                text    = re.sub(r"<[^>]+>", "",
+                                 turn.get("text", turn.get("content", "")))
+                lines.append(f"[{speaker}]: {text}")
+            parts.append("\n".join(lines))
+        return "\n\n".join(parts)
+
+    return ""
 
 
 # ─── Tensor-parallel validation ───────────────────────────────────────────────
