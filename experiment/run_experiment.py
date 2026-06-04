@@ -55,8 +55,10 @@ CONDITION_ORDER = ["D", "B", "C2", "E2", "C", "E", "A"]  # shortest → longest 
 CONDITIONS      = ["A", "B", "C", "C2", "D", "E", "E2"]
 MODELS          = ["72B", "7B"]
 CATEGORIES      = ["single_hop", "multi_hop", "temporal", "open_domain", "adversarial"]
-ALPHA           = 0.7   # hierarchical embedding blending coefficient
-K               = 5     # retrieval top-k
+ALPHA             = 0.7                      # hierarchical embedding blending coefficient
+K                 = 5                        # retrieval top-k (default)
+ENCODER_MODEL     = "BAAI/bge-base-en-v1.5"  # sentence encoder for all retrieval
+QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
 # Integer category labels used in locomo10.json → string names
 CATEGORY_MAP = {
@@ -113,6 +115,31 @@ def ensure_dirs():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ── Sentence splitting helpers ───────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ABBREV_RE = re.compile(r'\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|e\.g|i\.e|Fig|Vol|no)\.')
+
+
+def _split_sentences(text: str) -> list:
+    """Split on sentence boundaries while protecting common abbreviations."""
+    protected = _ABBREV_RE.sub(lambda m: m.group().replace('.', '\x00'), text)
+    parts = re.split(r'(?<=[.!?])\s+', protected.strip())
+    return [p.replace('\x00', '.').strip() for p in parts if p.strip()]
+
+
+def _merge_short(sentences: list, min_words: int = 4) -> list:
+    """Merge sentences shorter than min_words into the preceding sentence."""
+    out = []
+    for s in sentences:
+        if out and len(s.split()) < min_words:
+            out[-1] += ' ' + s
+        else:
+            out.append(s)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # ── Condition A  (Linear text) ──────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -155,9 +182,9 @@ def build_faiss_flat_index(chunks: list, encoder) -> faiss.Index:
     return index
 
 
-def retrieve_chunks(query: str, chunks: list, index: faiss.Index, encoder) -> list:
-    q = encoder.encode([query], normalize_embeddings=True).astype("float32")
-    _, idxs = index.search(q, K)
+def retrieve_chunks(query: str, chunks: list, index: faiss.Index, encoder, k: int = K) -> list:
+    q = encoder.encode([QUERY_INSTRUCTION + query], normalize_embeddings=True).astype("float32")
+    _, idxs = index.search(q, k)
     hits = [chunks[i] for i in idxs[0]]
     hits.sort(key=lambda x: (x["session_idx"], x["turn_idx"]))
     return hits
@@ -179,14 +206,22 @@ def escape_xml(text: str) -> str:
 def build_xml(conv: dict) -> str:
     parts = ['<?xml version="1.0" encoding="UTF-8"?>', "<conversation>"]
     for s_idx, session in enumerate(conv["sessions"]):
-        date = session.get("date", f"session-{s_idx+1}")
-        parts.append(f'  <session id="{s_idx+1}" date="{escape_xml(str(date))}">')
+        date     = session.get("date", f"session-{s_idx+1}")
+        speakers = sorted({t["speaker"] for t in session["turns"]})
+        parts.append(
+            f'  <session id="{s_idx+1}" date="{escape_xml(str(date))}" '
+            f'speakers="{escape_xml(", ".join(speakers))}">'
+        )
+        summary = (f'Session {s_idx+1} on {date}. '
+                   f'Participants: {", ".join(speakers)}. '
+                   f'{len(session["turns"])} turns.')
+        parts.append(f'    <summary>{escape_xml(summary)}</summary>')
         for turn in session["turns"]:
             speaker = escape_xml(turn["speaker"])
             ts      = turn.get("timestamp", "")
             content = re.sub(r"<[^>]+>", "", turn["content"])
             parts.append(f'    <turn speaker="{speaker}" timestamp="{ts}">')
-            for sent in re.split(r"(?<=[.!?])\s+", content.strip()):
+            for sent in _merge_short(_split_sentences(content)):
                 if sent.strip():
                     parts.append(f"      <utterance>{escape_xml(sent.strip())}</utterance>")
             parts.append("    </turn>")
@@ -267,9 +302,10 @@ def build_c2_index(nodes: list, encoder) -> faiss.Index:
     return index
 
 
-def retrieve_nodes_hierarchical(query: str, nodes: list, index: faiss.Index, encoder) -> list:
-    q = encoder.encode([query], normalize_embeddings=True).astype("float32")
-    _, idxs = index.search(q, K)
+def retrieve_nodes_hierarchical(query: str, nodes: list, index: faiss.Index,
+                                encoder, k: int = K) -> list:
+    q = encoder.encode([QUERY_INSTRUCTION + query], normalize_embeddings=True).astype("float32")
+    _, idxs = index.search(q, k)
     results = []
     for idx in idxs[0]:
         node, ancestors = nodes[idx], []
@@ -309,14 +345,22 @@ def build_html(conv: dict) -> str:
     """Render conversation as well-formed XHTML-compatible HTML parseable by ET."""
     parts = ["<html>"]
     for s_idx, session in enumerate(conv["sessions"]):
-        date = session.get("date", f"session-{s_idx+1}")
-        parts.append(f'  <section id="s{s_idx+1}" data-date="{escape_html(str(date))}">')
+        date     = session.get("date", f"session-{s_idx+1}")
+        speakers = sorted({t["speaker"] for t in session["turns"]})
+        parts.append(
+            f'  <section id="s{s_idx+1}" data-date="{escape_html(str(date))}" '
+            f'data-speakers="{escape_html(", ".join(speakers))}">'
+        )
+        summary = (f'Session {s_idx+1} on {date}. '
+                   f'Participants: {", ".join(speakers)}. '
+                   f'{len(session["turns"])} turns.')
+        parts.append(f'    <header>{escape_html(summary)}</header>')
         for turn in session["turns"]:
             speaker = escape_html(turn["speaker"])
             ts      = turn.get("timestamp", "")
             content = re.sub(r"<[^>]+>", "", turn["content"])
             parts.append(f'    <div data-speaker="{speaker}" data-timestamp="{ts}">')
-            for sent in re.split(r"(?<=[.!?])\s+", content.strip()):
+            for sent in _merge_short(_split_sentences(content)):
                 if sent.strip():
                     parts.append(f"      <p>{escape_html(sent.strip())}</p>")
             parts.append("    </div>")
@@ -540,7 +584,7 @@ def phase1_build(dataset: list):
 
     # ── Encoder for B, C2, E2 ────────────────────────────────────────────
     log("  Loading sentence encoder (all-MiniLM-L6-v2)...")
-    encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
+    encoder = SentenceTransformer(ENCODER_MODEL, device="cpu")
 
     # ── Condition B ──────────────────────────────────────────────────────
     log("  Building Condition B (chunks + FAISS)...")
@@ -856,7 +900,7 @@ def phase4_evaluate() -> pd.DataFrame:
 
     rouge = rouge_scorer_lib.RougeScorer(["rougeL", "rouge2"], use_stemmer=True)
     log("  Loading SBERT for semantic similarity...")
-    sbert = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
+    sbert = SentenceTransformer(ENCODER_MODEL, device="cpu")
 
     all_records = []
     for cond in CONDITIONS:
@@ -895,22 +939,22 @@ def phase4_evaluate() -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def build_tables(df: pd.DataFrame):
+    has_judge = "llm_judge" in df.columns and df["llm_judge"].notna().any()
+    agg_dict  = dict(f1=("f1","mean"), bleu1=("bleu1","mean"),
+                     rougeL=("rougeL","mean"), rouge2=("rouge2","mean"),
+                     meteor=("meteor","mean"), sbert_sim=("sbert_sim","mean"),
+                     n=("f1","count"))
+    if has_judge:
+        agg_dict["llm_judge"] = ("llm_judge", "mean")
+
     # Main accuracy table
     main = (
         df.groupby(["model", "condition", "category"])
-        .agg(f1=("f1","mean"), bleu1=("bleu1","mean"),
-             rougeL=("rougeL","mean"), rouge2=("rouge2","mean"),
-             meteor=("meteor","mean"), sbert_sim=("sbert_sim","mean"),
-             n=("f1","count"))
-        .round(4).reset_index()
+        .agg(**agg_dict).round(4).reset_index()
     )
     overall = (
         df.groupby(["model", "condition"])
-        .agg(f1=("f1","mean"), bleu1=("bleu1","mean"),
-             rougeL=("rougeL","mean"), rouge2=("rouge2","mean"),
-             meteor=("meteor","mean"), sbert_sim=("sbert_sim","mean"),
-             n=("f1","count"))
-        .round(4).reset_index()
+        .agg(**agg_dict).round(4).reset_index()
     )
     overall["category"] = "overall"
     main = pd.concat([main, overall], ignore_index=True)
@@ -998,6 +1042,90 @@ def format_results_for_report(main: pd.DataFrame, eff: pd.DataFrame,
             )
 
     return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ── Phase 4b: LLM-as-judge ───────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _parse_verdict(text: str) -> int:
+    t = text.strip().lower()
+    if t.startswith("incorrect") or ("incorrect" in t and "correct" not in t.replace("incorrect", "")):
+        return 0
+    return 1 if "correct" in t else 0
+
+
+def phase4b_llm_judge(model_and_tok=None,
+                      tensor_parallel_size: int = 4,
+                      gpu_memory_utilization: float = 0.90):
+    log("═" * 60)
+    log("PHASE 4b — LLM-as-judge (Qwen2.5-7B)")
+    log("═" * 60)
+
+    from vllm import LLM, SamplingParams
+
+    loaded_here = model_and_tok is None
+    if loaded_here:
+        log("  Loading Qwen2.5-7B for judging...")
+        judge_llm = LLM(
+            model=MODEL_IDS["7B"],
+            dtype="bfloat16",
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=False,
+            distributed_executor_backend="mp",
+        )
+    else:
+        judge_llm, _ = model_and_tok
+
+    judge_params = SamplingParams(temperature=0.0, max_tokens=10)
+
+    for cond in CONDITIONS:
+        for model_tag in MODELS:
+            path = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
+            if not path.exists():
+                continue
+            records = [json.loads(l) for l in path.open()]
+            if all(r.get("llm_judge") is not None for r in records):
+                log(f"  {cond}/{model_tag}: already judged, skipping")
+                continue
+
+            to_judge = [(i, r) for i, r in enumerate(records) if r.get("llm_judge") is None]
+            log(f"  {cond}/{model_tag}: judging {len(to_judge)} records...")
+
+            prompts = [
+                "You are evaluating whether a predicted answer correctly answers a question.\n\n"
+                f"Question: {r['question']}\n"
+                f"Reference Answer: {r['reference_answer']}\n"
+                f"Predicted Answer: {r['predicted_answer']}\n\n"
+                "Does the predicted answer correctly answer the question? "
+                "It is correct if it captures the key information, even if worded differently.\n"
+                "Reply with exactly one word: Correct or Incorrect."
+                for _, r in to_judge
+            ]
+            outputs = judge_llm.generate(prompts, judge_params)
+            for (i, _), out in zip(to_judge, outputs):
+                records[i]["llm_judge"] = _parse_verdict(out.outputs[0].text)
+
+            with path.open("w") as f:
+                for r in records:
+                    f.write(json.dumps(r) + "\n")
+
+            n_correct = sum(r.get("llm_judge", 0) for r in records)
+            log(f"  {cond}/{model_tag}: {n_correct}/{len(records)} correct "
+                f"({n_correct/len(records)*100:.1f}%)")
+
+    if loaded_here:
+        try:
+            judge_llm.llm_engine.shutdown()
+        except Exception:
+            pass
+        del judge_llm
+        gc.collect()
+        torch.cuda.empty_cache()
+        time.sleep(10)
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def generate_llm_narrative(results_text: str, model_and_tok) -> str:
@@ -1113,6 +1241,9 @@ def main():
                         help="GPU profile: h200x4 (default) or a100x2")
     parser.add_argument("--models", nargs="+", choices=["72B", "7B"], default=["72B", "7B"],
                         help="Which models to run (default: both)")
+    parser.add_argument("--rebuild", action="store_true",
+                        help="Force rebuild of all representations (needed after changing "
+                             "ENCODER_MODEL or structuring functions)")
     args_cli = parser.parse_args()
 
     # GPU profiles
@@ -1133,8 +1264,21 @@ def main():
     log("EngramTrace Concept Verification Experiment — starting")
     log(f"Base directory: {BASE}")
     log(f"GPU profile   : {args_cli.gpu}  (tp={TP}, gpu_mem={MEM})")
+    log(f"Encoder model : {ENCODER_MODEL}")
 
     ensure_dirs()
+
+    if args_cli.rebuild:
+        import shutil
+        log("--rebuild: clearing all pre-built representations and results...")
+        for d in [DATA / "condition_A", DATA / "condition_B",
+                  DATA / "condition_C", DATA / "condition_C2",
+                  DATA / "condition_E", DATA / "condition_E2",
+                  RESULTS]:
+            if d.exists():
+                shutil.rmtree(d)
+        ensure_dirs()
+        log("  Cleared. Re-running Phase 1 from scratch.")
 
     # ── Load LoCoMo ─────────────────────────────────────────────────────
     log("Loading LoCoMo dataset...")
@@ -1151,7 +1295,7 @@ def main():
     conv_ids = sorted({qa["conversation_id"] for qa in qa_pairs})
 
     log("Loading sentence encoder for inference...")
-    encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
+    encoder = SentenceTransformer(ENCODER_MODEL, device="cpu")
     reps    = load_representations(conv_ids)
 
     # ── Phase 2: Inference — 72B ─────────────────────────────────────────
@@ -1179,6 +1323,11 @@ def main():
 
     # ── Phase 4: Evaluation ──────────────────────────────────────────────
     df = phase4_evaluate()
+
+    # ── Phase 4b: LLM-as-judge ───────────────────────────────────────────
+    phase4b_llm_judge(model_and_tok=llm_7b,
+                      tensor_parallel_size=TP,
+                      gpu_memory_utilization=MEM)
 
     # ── Phase 5: Report (use loaded 7B for narrative) ────────────────────
     phase5_report(df, llm_7b=llm_7b)

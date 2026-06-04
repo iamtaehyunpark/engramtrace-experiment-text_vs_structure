@@ -7,7 +7,27 @@ from collections import Counter
 import numpy as np
 import faiss
 
-ALPHA = 0.7
+ALPHA             = 0.7
+ENCODER_MODEL     = "BAAI/bge-base-en-v1.5"
+QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
+
+_ABBREV_RE = re.compile(r'\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|e\.g|i\.e|Fig|Vol|no)\.')
+
+
+def _split_sentences(text: str) -> list:
+    protected = _ABBREV_RE.sub(lambda m: m.group().replace('.', '\x00'), text)
+    parts = re.split(r'(?<=[.!?])\s+', protected.strip())
+    return [p.replace('\x00', '.').strip() for p in parts if p.strip()]
+
+
+def _merge_short(sentences: list, min_words: int = 4) -> list:
+    out = []
+    for s in sentences:
+        if out and len(s.split()) < min_words:
+            out[-1] += ' ' + s
+        else:
+            out.append(s)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +79,7 @@ def build_faiss_flat_index(chunks: list, encoder) -> faiss.Index:
 
 def retrieve_chunks(query: str, chunks: list, index: faiss.Index,
                     encoder, k: int = 5) -> list:
-    q_emb    = encoder.encode([query], normalize_embeddings=True).astype('float32')
+    q_emb    = encoder.encode([QUERY_INSTRUCTION + query], normalize_embeddings=True).astype('float32')
     _, idxs  = index.search(q_emb, k)
     retrieved = [chunks[i] for i in idxs[0]]
     retrieved.sort(key=lambda x: (x['session_idx'], x['turn_idx']))
@@ -82,14 +102,22 @@ def escape_xml(text: str) -> str:
 def build_xml(conversation: dict) -> str:
     parts = ['<?xml version="1.0" encoding="UTF-8"?>', '<conversation>']
     for s_idx, session in enumerate(conversation['sessions']):
-        date = session.get('date', f'session-{s_idx+1}')
-        parts.append(f'  <session id="{s_idx+1}" date="{date}">')
+        date     = session.get('date', f'session-{s_idx+1}')
+        speakers = sorted({t['speaker'] for t in session['turns']})
+        parts.append(
+            f'  <session id="{s_idx+1}" date="{escape_xml(str(date))}" '
+            f'speakers="{escape_xml(", ".join(speakers))}">'
+        )
+        summary = (f'Session {s_idx+1} on {date}. '
+                   f'Participants: {", ".join(speakers)}. '
+                   f'{len(session["turns"])} turns.')
+        parts.append(f'    <summary>{escape_xml(summary)}</summary>')
         for turn in session['turns']:
             speaker = escape_xml(turn['speaker'])
             ts      = turn.get('timestamp', '')
             content = re.sub(r'<[^>]+>', '', turn['content'])
             parts.append(f'    <turn speaker="{speaker}" timestamp="{ts}">')
-            for sent in re.split(r'(?<=[.!?])\s+', content.strip()):
+            for sent in _merge_short(_split_sentences(content)):
                 if sent.strip():
                     parts.append(f'      <utterance>{escape_xml(sent.strip())}</utterance>')
             parts.append('    </turn>')
@@ -183,7 +211,7 @@ def build_c2_index(nodes: list, encoder) -> faiss.Index:
 
 def retrieve_nodes_hierarchical(query: str, nodes: list, index: faiss.Index,
                                   encoder, k: int = 5) -> list:
-    q_emb    = encoder.encode([query], normalize_embeddings=True).astype('float32')
+    q_emb    = encoder.encode([QUERY_INSTRUCTION + query], normalize_embeddings=True).astype('float32')
     _, idxs  = index.search(q_emb, k)
     results  = []
     for idx in idxs[0]:
@@ -227,14 +255,22 @@ def build_html(conversation: dict) -> str:
     """Render conversation as well-formed HTML parseable by ElementTree."""
     parts = ['<html>']
     for s_idx, session in enumerate(conversation['sessions']):
-        date = session.get('date', f'session-{s_idx+1}')
-        parts.append(f'  <section id="s{s_idx+1}" data-date="{escape_html(str(date))}">')
+        date     = session.get('date', f'session-{s_idx+1}')
+        speakers = sorted({t['speaker'] for t in session['turns']})
+        parts.append(
+            f'  <section id="s{s_idx+1}" data-date="{escape_html(str(date))}" '
+            f'data-speakers="{escape_html(", ".join(speakers))}">'
+        )
+        summary = (f'Session {s_idx+1} on {date}. '
+                   f'Participants: {", ".join(speakers)}. '
+                   f'{len(session["turns"])} turns.')
+        parts.append(f'    <header>{escape_html(summary)}</header>')
         for turn in session['turns']:
             speaker = escape_html(turn['speaker'])
             ts      = turn.get('timestamp', '')
             content = re.sub(r'<[^>]+>', '', turn['content'])
             parts.append(f'    <div data-speaker="{speaker}" data-timestamp="{ts}">')
-            for sent in re.split(r'(?<=[.!?])\s+', content.strip()):
+            for sent in _merge_short(_split_sentences(content)):
                 if sent.strip():
                     parts.append(f'      <p>{escape_html(sent.strip())}</p>')
             parts.append('    </div>')
