@@ -772,12 +772,24 @@ def jsonl_line_count(path: Path) -> int:
     return sum(1 for _ in path.open())
 
 
+def _valid_tp(model_tag: str, requested: int) -> int:
+    """Return the largest tp ≤ requested that evenly divides this model's attention heads."""
+    num_heads = {"72B": 64, "7B": 28}
+    heads = num_heads.get(model_tag, requested)
+    tp = requested
+    while tp > 1 and heads % tp != 0:
+        tp -= 1
+    return tp
+
+
 def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
                             encoder, conditions=None,
                             tensor_parallel_size=4,
                             gpu_memory_utilization=0.90):
     model_id   = MODEL_IDS[model_tag]
     conditions = conditions or CONDITION_ORDER
+
+    tensor_parallel_size = _valid_tp(model_tag, tensor_parallel_size)
 
     log(f"  Loading tokenizer ({model_id})...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
