@@ -632,7 +632,9 @@ def parse_args():
 
 def _model_gpu(args, model_tag: str) -> str:
     """Return the GPU profile for a specific model, respecting per-model overrides."""
-    override = getattr(args, f"gpu_{model_tag.replace('-', '_')}", None)
+    # argparse lowercases flag names: --gpu-72b → args.gpu_72b (not gpu_72B)
+    attr     = f"gpu_{model_tag.replace('-', '_').lower()}"
+    override = getattr(args, attr, None)
     return override if override else args.gpu
 
 
