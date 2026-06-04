@@ -170,12 +170,13 @@ def load_dataset():
             dataset.append(conv)
         return dataset
 
-    # Format B: [{sample_id: "conv-26", conversation: [...], ...}, ...]
+    # Format B: list format — ID may be in sample_id, id, or needs index fallback
     dataset = []
-    for conv in raw:
+    for i, conv in enumerate(raw):
         if isinstance(conv, dict):
             conv = dict(conv)
-            conv["conversation_id"] = _cid(conv)
+            cid  = _cid(conv)
+            conv["conversation_id"] = cid if cid != "unknown" else str(i)
             dataset.append(conv)
     return dataset
 
@@ -183,67 +184,68 @@ def load_dataset():
 def build_conversation_text(conversation: dict) -> str:
     """
     Convert a LoCoMo conversation dict into plain text for the atomizer.
-    Handles two formats:
-      A. sessions-list format: {sessions: [{date, turns: [{speaker, content}]}]}
-      B. native LoCoMo format: {conversation: [{session, speaker, text, timestamp}]}
+
+    Native locomo10.json format:
+      top-level keys: qa, conversation, sample_id, ...
+      conversation = {
+        "speaker_a": "Name", "speaker_b": "Name",
+        "session_1_date_time": "January 15, 2022 ...",
+        "session_1": [{"speaker": "A", "dia_id": "0_0", "text": "..."}, ...],
+        "session_2_date_time": "...",
+        "session_2": [...],
+        ...
+      }
     """
-    # Format A: sessions list
+    # Preprocessed sessions-list fallback (for compatibility)
     sessions = conversation.get("sessions", [])
-    if sessions and isinstance(sessions, list):
+    if sessions and isinstance(sessions, list) and isinstance(sessions[0], dict):
         parts = []
         for session in sessions:
             date  = session.get("date", "")
             lines = [f"=== Session{(' on ' + date) if date else ''} ==="]
             for turn in session.get("turns", []):
+                if not isinstance(turn, dict):
+                    continue
                 speaker = turn.get("speaker", "?")
-                ts      = turn.get("timestamp", "")
                 content = re.sub(r"<[^>]+>", "", turn.get("content", ""))
-                lines.append(f"[{speaker}{(', ' + ts) if ts else ''}]: {content}")
+                lines.append(f"[{speaker}]: {content}")
             parts.append("\n".join(lines))
         return "\n\n".join(parts)
 
-    # Format B: flat turn list under "conversation" key, grouped by session number
-    turns_raw = conversation.get("conversation", [])
-    if not turns_raw:
+    # Native LoCoMo format: conversation is a dict with session_N / session_N_date_time keys
+    conv_field = conversation.get("conversation")
+    if not conv_field or not isinstance(conv_field, dict):
+        log(f"  [build_conversation_text] 'conversation' field missing or not a dict "
+            f"(type={type(conv_field).__name__})", "WARN")
         return ""
 
-    if isinstance(turns_raw, list):
-        # Group by session field
-        sessions_dict: dict = {}
-        for turn in turns_raw:
-            sess = str(turn.get("session", turn.get("session_id", "1")))
-            sessions_dict.setdefault(sess, []).append(turn)
+    # Collect all session numbers from session_N keys
+    sess_nums = []
+    for k in conv_field:
+        m = re.match(r'^session_(\d+)$', k)
+        if m:
+            sess_nums.append(int(m.group(1)))
+    sess_nums = sorted(set(sess_nums))
 
-        parts = []
-        for sess_id in sorted(sessions_dict, key=lambda x: int(x) if x.isdigit() else x):
-            lines = [f"=== Session {sess_id} ==="]
-            for turn in sessions_dict[sess_id]:
-                speaker = turn.get("speaker", "?")
-                text    = re.sub(r"<[^>]+>", "",
-                                 turn.get("text", turn.get("utterance",
-                                          turn.get("content", ""))))
-                ts      = turn.get("timestamp", "")
-                lines.append(f"[{speaker}{(', ' + ts) if ts else ''}]: {text}")
-            parts.append("\n".join(lines))
-        return "\n\n".join(parts)
+    if not sess_nums:
+        log(f"  [build_conversation_text] no session_N keys found in conversation dict. "
+            f"Keys: {list(conv_field.keys())[:10]}", "WARN")
+        return ""
 
-    if isinstance(turns_raw, dict):
-        # {session_id: {date, turns: [...]}} format
-        parts = []
-        for sess_id, sess_data in sorted(turns_raw.items()):
-            if not isinstance(sess_data, dict):
+    parts = []
+    for n in sess_nums:
+        date  = conv_field.get(f"session_{n}_date_time", "")
+        turns = conv_field.get(f"session_{n}", [])
+        lines = [f"=== Session {n}{(' — ' + date) if date else ''} ==="]
+        for turn in turns:
+            if not isinstance(turn, dict):
                 continue
-            date  = sess_data.get("date", "")
-            lines = [f"=== Session {sess_id}{(' on ' + date) if date else ''} ==="]
-            for turn in sess_data.get("turns", sess_data.get("conversation", [])):
-                speaker = turn.get("speaker", "?")
-                text    = re.sub(r"<[^>]+>", "",
-                                 turn.get("text", turn.get("content", "")))
-                lines.append(f"[{speaker}]: {text}")
-            parts.append("\n".join(lines))
-        return "\n\n".join(parts)
+            speaker = turn.get("speaker", "?")
+            text    = re.sub(r"<[^>]+>", "", turn.get("text", ""))
+            lines.append(f"[{speaker}]: {text}")
+        parts.append("\n".join(lines))
 
-    return ""
+    return "\n\n".join(parts)
 
 
 # ─── Tensor-parallel validation ───────────────────────────────────────────────
