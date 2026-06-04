@@ -1244,6 +1244,9 @@ def main():
     parser.add_argument("--rebuild", action="store_true",
                         help="Force rebuild of all representations (needed after changing "
                              "ENCODER_MODEL or structuring functions)")
+    parser.add_argument("--inference-only", action="store_true",
+                        help="Internal flag: skip Phase 1, ablation, and eval — "
+                             "used when the main process spawns per-model subprocesses")
     args_cli = parser.parse_args()
 
     # GPU profiles
@@ -1286,64 +1289,79 @@ def main():
 
     qa_path = QUESTIONS / "locomo_qa.jsonl"
 
+    import subprocess as _sp
+    this_script = str(Path(__file__).resolve())
+
+    if args_cli.inference_only:
+        # ── Subprocess mode: inference only ─────────────────────────────
+        # Called by the orchestrator below. Runs Phase 2 or 3 for one model
+        # then exits, fully releasing GPU memory before the next model loads.
+        qa_pairs = [json.loads(l) for l in qa_path.open()]
+        conv_ids = sorted({qa["conversation_id"] for qa in qa_pairs})
+        encoder  = SentenceTransformer(ENCODER_MODEL, device="cpu")
+        reps     = load_representations(conv_ids)
+        model_tag = args_cli.models[0]
+        log(f"INFERENCE-ONLY mode: {model_tag}")
+        result = run_inference_for_model(model_tag, qa_pairs, reps, encoder,
+                                         tensor_parallel_size=TP,
+                                         gpu_memory_utilization=MEM)
+        unload_llm(result)
+        del encoder, reps
+        gc.collect()
+        log(f"INFERENCE-ONLY done: {model_tag}. Process exiting to free GPU.")
+        return
+
     # ── Phase 1: Build representations ──────────────────────────────────
     phase1_build(dataset)
 
-    # ── Load QA pairs + shared encoder ──────────────────────────────────
+    # ── Load QA pairs ────────────────────────────────────────────────────
     qa_pairs = [json.loads(l) for l in qa_path.open()]
     log(f"QA pairs: {len(qa_pairs)}")
-    conv_ids = sorted({qa["conversation_id"] for qa in qa_pairs})
-
-    log("Loading sentence encoder for inference...")
-    encoder = SentenceTransformer(ENCODER_MODEL, device="cpu")
-    reps    = load_representations(conv_ids)
 
     # ── Phase 1b: α/k retrieval ablation (CPU-only) ──────────────────────
     log("═" * 60)
     log("PHASE 1b — α/k retrieval ablation (C2 and E2)")
     log("═" * 60)
-    import subprocess
-    ablation_script = BASE / "ablation_retrieval.py"
-    ablation_out    = EVAL / "tables" / "ablation_retrieval.csv"
-    subprocess.run(
-        [sys.executable, str(ablation_script), "--output", str(ablation_out)],
+    ablation_out = EVAL / "tables" / "ablation_retrieval.csv"
+    _sp.run(
+        [sys.executable, str(BASE / "ablation_retrieval.py"),
+         "--output", str(ablation_out)],
         check=False,
     )
 
-    # ── Phase 2: Inference — 72B ─────────────────────────────────────────
-    llm_7b = None
-    if "72B" in args_cli.models:
+    # ── Phase 2 & 3: Inference — each model in its own subprocess ────────
+    # vLLM worker processes hold the CUDA context until the OS process exits.
+    # Running both models in one process causes OOM on the second load.
+    # Spawning separate subprocesses guarantees full GPU release between models.
+    for model_tag in args_cli.models:
+        phase_num = "2" if model_tag == "72B" else "3"
         log("═" * 60)
-        log("PHASE 2 — Inference (Qwen2.5-72B-Instruct)")
+        log(f"PHASE {phase_num} — Inference ({MODEL_IDS[model_tag]}) [subprocess]")
         log("═" * 60)
-        llm_72b = run_inference_for_model("72B", qa_pairs, reps, encoder,
-                                          tensor_parallel_size=TP,
-                                          gpu_memory_utilization=MEM)
-        unload_llm(llm_72b)
-
-    # ── Phase 3: Inference — 7B ──────────────────────────────────────────
-    if "7B" in args_cli.models:
-        log("═" * 60)
-        log("PHASE 3 — Inference (Qwen2.5-7B-Instruct)")
-        log("═" * 60)
-        llm_7b = run_inference_for_model("7B", qa_pairs, reps, encoder,
-                                         tensor_parallel_size=TP,
-                                         gpu_memory_utilization=MEM)
-
-    del encoder, reps
-    gc.collect()
+        cmd = [
+            sys.executable, this_script,
+            "--gpu", args_cli.gpu,
+            "--models", model_tag,
+            "--inference-only",
+        ]
+        ret = _sp.run(cmd, check=False)
+        if ret.returncode != 0:
+            log(f"ERROR: inference subprocess for {model_tag} exited with code {ret.returncode}", "ERROR")
+            sys.exit(ret.returncode)
 
     # ── Phase 4: Evaluation ──────────────────────────────────────────────
     df = phase4_evaluate()
 
     # ── Phase 4b: LLM-as-judge ───────────────────────────────────────────
-    phase4b_llm_judge(model_and_tok=llm_7b,
-                      tensor_parallel_size=TP,
-                      gpu_memory_utilization=MEM)
+    # No already-loaded model here (subprocesses exited), so phase4b loads
+    # and unloads 7B itself.
+    if "7B" in args_cli.models:
+        phase4b_llm_judge(model_and_tok=None,
+                          tensor_parallel_size=TP,
+                          gpu_memory_utilization=MEM)
 
-    # ── Phase 5: Report (use loaded 7B for narrative) ────────────────────
-    phase5_report(df, llm_7b=llm_7b)
-    unload_llm(llm_7b)
+    # ── Phase 5: Report ──────────────────────────────────────────────────
+    phase5_report(df, llm_7b=None)
 
     elapsed = (time.perf_counter() - t_start) / 3600
     log(f"Experiment complete. Total wall time: {elapsed:.2f} hours")
