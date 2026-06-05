@@ -90,6 +90,7 @@ def ensure_dirs():
         DATA / "condition_ET",
         QUESTIONS,
         RESULTS / "condition_ET",
+        RESULTS / "condition_ET-R",
         EVAL / "scores",
         EVAL / "tables",
     ]:
@@ -458,6 +459,146 @@ def phase2_qa_inference(client, model_tag: str, qa_pairs: list, dataset: list):
     log(f"[Phase 2] [{model_tag}] Done. {jsonl_line_count(out_path)} answers written.")
 
 
+# ─── Phase 2-R — ET-R: same KB, direct p-node retrieval ──────────────────────
+
+def phase2r_qa_inference(client, model_tag: str, qa_pairs: list, k: int = 5):
+    """
+    ET-R: same LLM-generated KB as ET, but retrieves p-node snippets directly
+    (like C2/E2) instead of EngramTrace's parent-section context assembly.
+
+    This isolates the contribution of LLM-generated HTML structure from
+    EngramTrace's conversational context mechanism.
+    """
+    import numpy as np
+    from bs4 import BeautifulSoup
+    from vllm import SamplingParams
+
+    model_id = MODEL_IDS[model_tag]
+    out_path = RESULTS / "condition_ET-R" / f"{model_tag}.jsonl"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n_done   = jsonl_line_count(out_path)
+
+    if n_done == len(qa_pairs):
+        log(f"[Phase 2-R] [{model_tag}] Already complete. Skipping.")
+        return
+
+    log(f"[Phase 2-R] ET-R direct retrieval, {len(qa_pairs)-n_done} remaining...")
+
+    answer_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=256,
+        stop=["\n\nQuestion:", "\n\nAnswer:"],
+    )
+
+    # Cache per-conversation KB data (10 conversations — fits in memory easily)
+    conv_cache: dict = {}
+
+    def load_conv(cid: str):
+        kb_dir   = DATA / "condition_ET" / f"conv_{cid}"
+        emb_path = kb_dir / "p_embeddings.json"
+        kb_path  = kb_dir / "knowledge_base.html"
+        if not emb_path.exists() or not kb_path.exists():
+            return None
+        p_emb = json.loads(emb_path.read_text())
+        if not p_emb:
+            return None
+        soup  = BeautifulSoup(kb_path.read_text(), "lxml")
+        ids   = list(p_emb.keys())
+        vecs  = np.array([p_emb[pid]["vector"] for pid in ids], dtype="float32")
+        return {"ids": ids, "vecs": vecs, "soup": soup}
+
+    current_cid = None
+
+    with open(out_path, "a", buffering=1) as out_f:
+        for i, qa in enumerate(tqdm(qa_pairs, desc=f"  QA-R [{model_tag}]")):
+            if i < n_done:
+                continue
+
+            cid = str(qa["conversation_id"])
+            if cid != current_cid:
+                current_cid = cid
+                if cid not in conv_cache:
+                    conv_cache[cid] = load_conv(cid)
+
+            data = conv_cache.get(cid)
+            t0   = time.perf_counter()
+
+            if data is None:
+                answer = ""
+                in_toks = out_toks = 0
+            else:
+                # Embed query with asymmetric instruction prefix
+                q_vec = np.array(
+                    client.generate_query_embedding(qa["question"]), dtype="float32"
+                )
+
+                # Cosine similarity → top-k p-nodes
+                q_norm = np.linalg.norm(q_vec)
+                if q_norm == 0:
+                    top_k_idxs = list(range(min(k, len(data["ids"]))))
+                else:
+                    norms = np.linalg.norm(data["vecs"], axis=1) * q_norm
+                    norms = np.where(norms == 0, 1e-10, norms)
+                    sims  = np.dot(data["vecs"], q_vec) / norms
+                    top_k_idxs = np.argsort(sims)[::-1][:k].tolist()
+
+                # Build context: p-node text + ancestor path (same format as C2/E2)
+                parts = []
+                for rank, idx in enumerate(top_k_idxs):
+                    p_id  = data["ids"][idx]
+                    p_tag = data["soup"].find(id=p_id)
+                    if not p_tag:
+                        continue
+                    ancestors = []
+                    for parent in p_tag.parents:
+                        if (hasattr(parent, "name") and parent.name
+                                and parent.name not in ("html", "body", "[document]")):
+                            ancestors.insert(0, f"<{parent.name}>")
+                    path = " > ".join(ancestors) if ancestors else "<root>"
+                    parts.append(
+                        f"--- Retrieved Node {rank+1} [path: {path} > <p>] ---\n"
+                        f"{p_tag.get_text(strip=True)}"
+                    )
+                context = "\n\n".join(parts)
+
+                # Assemble prompt (same style as C2/E2 in the main experiment)
+                prompt_text = (
+                    "You are a helpful assistant. Answer the question based on "
+                    "the retrieved conversation nodes below. Each node is shown "
+                    "with its path in the knowledge base followed by its content.\n\n"
+                    f"Retrieved Nodes:\n{context}\n\n"
+                    f"Question: {qa['question']}\nAnswer:"
+                )
+
+                # Tokenise and generate (no chat template — same as original experiment)
+                token_ids = client.tokenizer.encode(
+                    prompt_text, add_special_tokens=False
+                )
+                output  = client.llm.generate(
+                    [{"prompt_token_ids": token_ids}], answer_params
+                )
+                answer   = output[0].outputs[0].text.strip()
+                in_toks  = len(output[0].prompt_token_ids)
+                out_toks = len(output[0].outputs[0].token_ids)
+
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            out_f.write(json.dumps({
+                "question_id":      qa["question_id"],
+                "conversation_id":  cid,
+                "condition":        "ET-R",
+                "model":            model_id,
+                "category":         qa["category"],
+                "question":         qa["question"],
+                "reference_answer": qa["answer"],
+                "predicted_answer": answer,
+                "input_tokens":     in_toks,
+                "output_tokens":    out_toks,
+                "inference_ms":     round(elapsed_ms, 1),
+            }) + "\n")
+
+    log(f"[Phase 2-R] [{model_tag}] Done. {jsonl_line_count(out_path)} answers written.")
+
+
 # ─── Phase 3 — Evaluation metrics ────────────────────────────────────────────
 
 def compute_f1(pred: str, ref: str) -> float:
@@ -484,41 +625,41 @@ def phase3_evaluate(model_tags: list):
     smooth = SmoothingFunction().method1
 
     for model_tag in model_tags:
-        out_path  = RESULTS / "condition_ET" / f"{model_tag}.jsonl"
-        eval_path = EVAL / "scores" / f"ET_{model_tag}.jsonl"
+        for cond_tag in ["ET", "ET-R"]:
+            out_path  = RESULTS / f"condition_{cond_tag}" / f"{model_tag}.jsonl"
+            eval_path = EVAL / "scores" / f"{cond_tag}_{model_tag}.jsonl"
 
-        if not out_path.exists():
-            log(f"  No results for {model_tag} — skipping.", "WARN")
-            continue
+            if not out_path.exists():
+                continue
 
-        if eval_path.exists() and sum(1 for _ in eval_path.open()) == sum(1 for _ in out_path.open()):
-            log(f"  [{model_tag}] Evaluation already complete. Skipping.")
-            continue
+            if eval_path.exists() and sum(1 for _ in eval_path.open()) == sum(1 for _ in out_path.open()):
+                log(f"  [{model_tag}] {cond_tag} evaluation already complete. Skipping.")
+                continue
 
-        records = [json.loads(l) for l in out_path.open()]
-        scored  = []
-        for rec in tqdm(records, desc=f"  Eval [{model_tag}]"):
-            pred = rec.get("predicted_answer", "")
-            ref  = rec.get("reference_answer", "")
-            r    = rouge.score(ref, pred)
-            pe   = sbert.encode(pred, convert_to_tensor=True)
-            re_  = sbert.encode(ref,  convert_to_tensor=True)
-            entry = dict(rec)
-            entry.update({
-                "f1":        compute_f1(pred, ref),
-                "bleu1":     sentence_bleu([ref.lower().split()], pred.lower().split(),
-                                            weights=(1, 0, 0, 0), smoothing_function=smooth),
-                "rougeL":    r["rougeL"].fmeasure,
-                "rouge2":    r["rouge2"].fmeasure,
-                "meteor":    meteor_score([ref.split()], pred.split()),
-                "sbert_sim": float(st_util.cos_sim(pe, re_)),
-            })
-            scored.append(entry)
+            records = [json.loads(l) for l in out_path.open()]
+            scored  = []
+            for rec in tqdm(records, desc=f"  Eval {cond_tag} [{model_tag}]"):
+                pred = rec.get("predicted_answer", "")
+                ref  = rec.get("reference_answer", "")
+                r    = rouge.score(ref, pred)
+                pe   = sbert.encode(pred, convert_to_tensor=True)
+                re_  = sbert.encode(ref,  convert_to_tensor=True)
+                entry = dict(rec)
+                entry.update({
+                    "f1":        compute_f1(pred, ref),
+                    "bleu1":     sentence_bleu([ref.lower().split()], pred.lower().split(),
+                                                weights=(1, 0, 0, 0), smoothing_function=smooth),
+                    "rougeL":    r["rougeL"].fmeasure,
+                    "rouge2":    r["rouge2"].fmeasure,
+                    "meteor":    meteor_score([ref.split()], pred.split()),
+                    "sbert_sim": float(st_util.cos_sim(pe, re_)),
+                })
+                scored.append(entry)
 
-        with open(eval_path, "w") as f:
-            for s in scored:
-                f.write(json.dumps(s) + "\n")
-        log(f"  [{model_tag}] Evaluation done. {len(scored)} records.")
+            with open(eval_path, "w") as f:
+                for s in scored:
+                    f.write(json.dumps(s) + "\n")
+            log(f"  [{model_tag}] {cond_tag} evaluation done. {len(scored)} records.")
 
 
 # ─── Phase 4 — Report ────────────────────────────────────────────────────────
@@ -605,13 +746,14 @@ def phase4_report(model_tags: list):
 
     rows_et = []
     for model_tag in model_tags:
-        eval_path = EVAL / "scores" / f"ET_{model_tag}.jsonl"
-        if not eval_path.exists():
-            continue
-        for line in eval_path.open():
-            r = json.loads(line)
-            r["model_tag"] = model_tag
-            rows_et.append(r)
+        for cond_tag in ["ET", "ET-R"]:
+            eval_path = EVAL / "scores" / f"{cond_tag}_{model_tag}.jsonl"
+            if not eval_path.exists():
+                continue
+            for line in eval_path.open():
+                r = json.loads(line)
+                r["model_tag"] = model_tag
+                rows_et.append(r)
 
     if not rows_et:
         log("[Phase 4] No evaluated results found.", "WARN")
@@ -621,7 +763,8 @@ def phase4_report(model_tags: list):
     token_totals = _load_et_token_totals(model_tags)
 
     other_conds  = ["A", "B", "C", "C2", "D", "E", "E2"]
-    other_tokens = _load_other_avg_tokens(model_tags, other_conds)
+    # Also load ET-R per-QA token averages for efficiency comparison
+    other_tokens = _load_other_avg_tokens(model_tags, other_conds + ["ET-R"])
 
     # ── Load all condition rows for F1 table ──────────────────────────────
     all_rows = list(rows_et)
@@ -645,20 +788,21 @@ def phase4_report(model_tags: list):
 
     # ── Per-category accuracy ─────────────────────────────────────────────
     for model_tag in model_tags:
-        sub = df[df["model_tag"] == model_tag]
-        if sub.empty:
-            continue
-        print(f"\n── Accuracy  [{model_tag}] ──")
-        overall = sub[metric_cols].mean()
-        print(f"  {'Overall':<14} " + " ".join(f"{overall[m]:<8.4f}" for m in metric_cols))
-        print(f"  {'Category':<14} " + " ".join(f"{m:<8}" for m in metric_cols))
-        print("  " + "-" * 68)
-        for cat in CATEGORIES:
-            cat_sub = sub[sub["category"] == cat]
-            if cat_sub.empty:
+        for cond_tag in ["ET", "ET-R"]:
+            sub = df[(df["model_tag"] == model_tag) & (df["condition"] == cond_tag)]
+            if sub.empty:
                 continue
-            means = cat_sub[metric_cols].mean()
-            print(f"  {cat:<14} " + " ".join(f"{means[m]:<8.4f}" for m in metric_cols))
+            print(f"\n── Accuracy  [{model_tag}]  {cond_tag} ──")
+            overall = sub[metric_cols].mean()
+            print(f"  {'Overall':<14} " + " ".join(f"{overall[m]:<8.4f}" for m in metric_cols))
+            print(f"  {'Category':<14} " + " ".join(f"{m:<8}" for m in metric_cols))
+            print("  " + "-" * 68)
+            for cat in CATEGORIES:
+                cat_sub = sub[sub["category"] == cat]
+                if cat_sub.empty:
+                    continue
+                means = cat_sub[metric_cols].mean()
+                print(f"  {cat:<14} " + " ".join(f"{means[m]:<8.4f}" for m in metric_cols))
 
     # ══════════════════════════════════════════════════════════════════════
     # TOKEN EFFICIENCY — THREE VIEWS
@@ -702,6 +846,15 @@ def phase4_report(model_tags: list):
         f1k_p2 = mean_f1 / (p2_avg / 1000) if p2_avg > 0 else float("nan")
         print(f"  {'ET*':<6} {p2_avg:>14,.1f} {mean_f1:>8.4f} {f1k_p2:>9.4f}"
               f"  * Phase 2 only; KB build excluded")
+
+        # ET-R — direct retrieval on same KB (no EngramTrace context assembly)
+        etr_sub = df[(df["model_tag"] == model_tag) & (df["condition"] == "ET-R")]
+        if not etr_sub.empty:
+            etr_f1   = etr_sub["f1"].mean()
+            etr_toks = other_tokens.get(("ET-R", model_tag), 0)
+            etr_f1k  = etr_f1 / (etr_toks / 1000) if etr_toks > 0 else float("nan")
+            print(f"  {'ET-R†':<6} {etr_toks:>14,.1f} {etr_f1:>8.4f} {etr_f1k:>9.4f}"
+                  f"  † same KB; direct p-node retrieval (no parent sections)")
 
         # ── View 2: KB Structuring cost (Phase 1, ET-specific) ────────────
         print(f"\n  View 2 — KB Structuring Cost (Phase 1, paid once per conversation)")
@@ -751,20 +904,34 @@ def phase4_report(model_tags: list):
         print(f"  {'ET':<6} {p1_per_qa:>10,.1f} {p2_avg:>10,.1f} {total_amort:>10,.1f} "
               f"{mean_f1:>8.4f} {f1k_total:>13.4f}")
 
+        # ET-R: same Phase 1 cost, but much cheaper Phase 2
+        etr_sub = df[(df["model_tag"] == model_tag) & (df["condition"] == "ET-R")]
+        if not etr_sub.empty:
+            etr_f1      = etr_sub["f1"].mean()
+            etr_p2_avg  = other_tokens.get(("ET-R", model_tag), 0)
+            etr_total   = p1_per_qa + etr_p2_avg
+            etr_f1k     = etr_f1 / (etr_total / 1000) if etr_total > 0 else float("nan")
+            print(f"  {'ET-R':<6} {p1_per_qa:>10,.1f} {etr_p2_avg:>10,.1f} {etr_total:>10,.1f} "
+                  f"{etr_f1:>8.4f} {etr_f1k:>13.4f}")
+
     # ── F1 comparison table ───────────────────────────────────────────────
     if len(df_all) > len(df):
         print("\n" + "─" * 72)
         print("F1 Comparison (Overall)")
         print("─" * 72)
         pivot = df_all.groupby(["condition", "model_tag"])["f1"].mean().unstack("model_tag")
-        pivot = pivot.reindex([c for c in other_conds + [CONDITION] if c in pivot.index])
+        pivot = pivot.reindex([c for c in other_conds + [CONDITION, "ET-R"] if c in pivot.index])
         print(pivot.to_string(float_format="%.4f"))
 
         print("\n── Statistical Tests (paired t-test on F1) ──")
         for cond_a, cond_b, label in [
-            ("ET", "B",  "flat RAG"),
-            ("ET", "C2", "hier. XML RAG"),
-            ("ET", "E2", "hier. HTML RAG"),
+            ("ET",   "B",    "flat RAG"),
+            ("ET",   "C2",   "hier. XML RAG"),
+            ("ET",   "E2",   "hier. HTML RAG"),
+            ("ET-R", "B",    "ET-R vs flat RAG"),
+            ("ET-R", "C2",   "ET-R vs hier. XML RAG"),
+            ("ET-R", "E2",   "ET-R vs hier. HTML RAG"),
+            ("ET-R", "ET",   "ET-R vs full EngramTrace"),
         ]:
             for model_tag in model_tags:
                 a_f1 = df_all[(df_all["condition"] == cond_a) &
@@ -806,6 +973,8 @@ def parse_args():
                    help="Skip Phase 1 KB building (use existing KBs)")
     p.add_argument("--skip-qa",      action="store_true",
                    help="Skip Phase 2 QA inference (re-evaluate existing answers)")
+    p.add_argument("--skip-qa-r",    action="store_true",
+                   help="Skip Phase 2-R ET-R direct retrieval inference")
     p.add_argument("--inference-only", action="store_true",
                    help="INTERNAL: run one model's phases 1+2 then exit (subprocess mode)")
     return p.parse_args()
@@ -836,7 +1005,7 @@ def main():
 
         # Load vLLM ONCE for both phases — avoids CUDA worker leak between loads.
         # (Phase 1 and Phase 2 share the same LocalLLMClient instance.)
-        need_llm = (not args.skip_build) or (not args.skip_qa)
+        need_llm = (not args.skip_build) or (not args.skip_qa) or (not args.skip_qa_r)
         client   = None
 
         if need_llm:
@@ -849,6 +1018,9 @@ def main():
 
         if not args.skip_qa:
             phase2_qa_inference(client, model_tag, qa_pairs, dataset)
+
+        if not args.skip_qa_r:
+            phase2r_qa_inference(client, model_tag, qa_pairs)
 
         return
 
@@ -866,8 +1038,12 @@ def main():
         if et_res.exists():
             shutil.rmtree(et_res)
             log("Rebuilt: removed results/condition_ET")
+        et_res_r = RESULTS / "condition_ET-R"
+        if et_res_r.exists():
+            shutil.rmtree(et_res_r)
+            log("Rebuilt: removed results/condition_ET-R")
         et_scores = EVAL / "scores"
-        for f in et_scores.glob("ET_*.jsonl"):
+        for f in list(et_scores.glob("ET_*.jsonl")) + list(et_scores.glob("ET-R_*.jsonl")):
             f.unlink()
             log(f"Rebuilt: removed {f.name}")
         ensure_dirs()
@@ -887,6 +1063,8 @@ def main():
             cmd.append("--skip-build")
         if args.skip_qa:
             cmd.append("--skip-qa")
+        if args.skip_qa_r:
+            cmd.append("--skip-qa-r")
 
         ret = _sp.run(cmd, check=False)
         if ret.returncode != 0:
