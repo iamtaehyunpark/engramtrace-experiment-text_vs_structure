@@ -861,18 +861,34 @@ def run_inference_for_model(model_tag: str, qa_pairs: list, reps: dict,
     return llm, tokenizer
 
 
-def unload_llm(model_and_tok):
-    llm, tok = model_and_tok
+def _teardown_vllm(llm):
+    """Shut down a vLLM LLM instance and fully clear GPU memory before the next load."""
     try:
         llm.llm_engine.shutdown()
     except Exception:
         pass
-    del llm, tok
+    del llm
     gc.collect()
-    torch.cuda.empty_cache()
-    time.sleep(20)  # wait for worker processes to fully exit and release GPU memory
+    try:
+        for i in range(torch.cuda.device_count()):
+            with torch.cuda.device(i):
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+    time.sleep(30)
     gc.collect()
-    torch.cuda.empty_cache()
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def unload_llm(model_and_tok):
+    llm, tok = model_and_tok
+    _teardown_vllm(llm)
+    del tok
     log("  Model unloaded, GPU memory cleared.")
 
 
@@ -1138,16 +1154,7 @@ def phase4b_llm_judge(model_and_tok=None,
                 f"({n_correct/len(records)*100:.1f}%)")
 
     if loaded_here:
-        try:
-            judge_llm.llm_engine.shutdown()
-        except Exception:
-            pass
-        del judge_llm
-        gc.collect()
-        torch.cuda.empty_cache()
-        time.sleep(10)
-        gc.collect()
-        torch.cuda.empty_cache()
+        _teardown_vllm(judge_llm)
 
 
 def generate_llm_narrative(results_text: str, model_and_tok) -> str:

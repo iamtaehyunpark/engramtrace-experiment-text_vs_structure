@@ -316,6 +316,34 @@ def _valid_tp(model_tag: str, requested: int) -> int:
     return tp
 
 
+# ─── GPU teardown helper ──────────────────────────────────────────────────────
+
+def _teardown_vllm(llm):
+    """Shut down a vLLM LLM instance and fully clear GPU memory before the next load."""
+    try:
+        llm.llm_engine.shutdown()
+    except Exception:
+        pass
+    del llm
+    gc.collect()
+    try:
+        import torch
+        for i in range(torch.cuda.device_count()):
+            with torch.cuda.device(i):
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+    time.sleep(30)
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 # ─── Phase 1 — Build EngramTrace KBs ─────────────────────────────────────────
 
 def _load_client(model_tag: str, tensor_parallel_size: int,
@@ -871,20 +899,7 @@ def phase3b_llm_judge(model_tags: list, tensor_parallel_size: int = 1,
             log(f"  [Phase 3b] {cond}/{model_tag}: {n_ok}/{len(records)} correct "
                 f"({100*n_ok/len(records):.1f}%)")
 
-    try:
-        judge_llm.llm_engine.shutdown()
-    except Exception:
-        pass
-    del judge_llm
-    gc.collect()
-    try:
-        import torch
-        torch.cuda.empty_cache()
-        time.sleep(5)
-        gc.collect()
-        torch.cuda.empty_cache()
-    except Exception:
-        pass
+    _teardown_vllm(judge_llm)
     log("[Phase 3b] Judging complete.")
 
 
@@ -1378,6 +1393,11 @@ def main():
 
         if run_qa_r_s:
             phase2r_qa_inference(client, model_tag, qa_pairs, kb_condition="ET-S")
+
+        if client is not None:
+            log(f"[Subprocess {model_tag}] Tearing down vLLM and clearing GPU memory...")
+            _teardown_vllm(client.llm)
+            client = None
 
         return
 
