@@ -823,6 +823,8 @@ def phase3b_llm_judge(model_tags: list, tensor_parallel_size: int = 1,
         log("[Phase 3b] No ET results found to judge. Skipping.")
         return
 
+    import os
+    os.environ["VLLM_USE_V1"] = "0"  # v1 memory assertion breaks after subprocess unload
     log(f"[Phase 3b] Loading Qwen2.5-7B judge (tp={tensor_parallel_size})...")
     judge_llm = LLM(
         model=MODEL_IDS["7B"],

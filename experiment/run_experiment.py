@@ -1080,6 +1080,8 @@ def phase4b_llm_judge(model_and_tok=None,
 
     loaded_here = model_and_tok is None
     if loaded_here:
+        import os
+        os.environ["VLLM_USE_V1"] = "0"  # v1 memory assertion breaks after subprocess unload
         log("  Loading Qwen2.5-7B for judging...")
         judge_llm = LLM(
             model=MODEL_IDS["7B"],
