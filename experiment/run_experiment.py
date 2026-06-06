@@ -14,6 +14,11 @@ Install first:
     python -m nltk.downloader punkt wordnet averaged_perceptron_tagger
 """
 
+# Force vLLM v0 engine — v1 has a memory-profiling assertion that fires when
+# CUDA contexts from previous processes aren't fully released before the next load.
+import os
+os.environ["VLLM_USE_V1"] = "0"
+
 # ─── stdlib ─────────────────────────────────────────────────────────────────
 import gc
 import json
@@ -1096,8 +1101,6 @@ def phase4b_llm_judge(model_and_tok=None,
 
     loaded_here = model_and_tok is None
     if loaded_here:
-        import os
-        os.environ["VLLM_USE_V1"] = "0"  # v1 memory assertion breaks after subprocess unload
         log("  Loading Qwen2.5-7B for judging...")
         judge_llm = LLM(
             model=MODEL_IDS["7B"],

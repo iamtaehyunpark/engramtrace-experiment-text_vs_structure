@@ -20,6 +20,11 @@ Requires beautifulsoup4 and lxml in addition to the main experiment deps:
     pip install beautifulsoup4 lxml
 """
 
+# Force vLLM v0 engine — v1 has a memory-profiling assertion that fires when
+# CUDA contexts from previous processes aren't fully released before the next load.
+import os
+os.environ["VLLM_USE_V1"] = "0"
+
 # ─── stdlib ──────────────────────────────────────────────────────────────────
 import argparse
 import gc
@@ -851,8 +856,6 @@ def phase3b_llm_judge(model_tags: list, tensor_parallel_size: int = 1,
         log("[Phase 3b] No ET results found to judge. Skipping.")
         return
 
-    import os
-    os.environ["VLLM_USE_V1"] = "0"  # v1 memory assertion breaks after subprocess unload
     log(f"[Phase 3b] Loading Qwen2.5-7B judge (tp={tensor_parallel_size})...")
     judge_llm = LLM(
         model=MODEL_IDS["7B"],
