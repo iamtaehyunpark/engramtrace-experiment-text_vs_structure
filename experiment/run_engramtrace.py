@@ -60,6 +60,8 @@ CATEGORY_MAP    = {1: "single_hop", 2: "multi_hop", 3: "temporal",
 
 # GPU profiles → (tensor_parallel_size, gpu_memory_utilization)
 GPU_PROFILES = {
+    "h200x1":  (1, 0.90),
+    "h200x2":  (2, 0.90),
     "h200x4":  (4, 0.90),
     "a100x2":  (2, 0.95),
     "a100x4":  (4, 0.90),
@@ -88,9 +90,12 @@ def log(msg: str, level: str = "INFO"):
 def ensure_dirs():
     for d in [
         DATA / "condition_ET",
+        DATA / "condition_ET-S",
         QUESTIONS,
         RESULTS / "condition_ET",
         RESULTS / "condition_ET-R",
+        RESULTS / "condition_ET-S",
+        RESULTS / "condition_ET-S-R",
         EVAL / "scores",
         EVAL / "tables",
     ]:
@@ -249,6 +254,55 @@ def build_conversation_text(conversation: dict) -> str:
     return "\n\n".join(parts)
 
 
+def _extract_sessions(conversation: dict) -> list:
+    """
+    Returns a list of per-session text strings from a LoCoMo conversation.
+    Each element covers exactly one session (date header + turns).
+    Used by phase1_build_kbs_persession to atomize each session separately.
+    """
+    # Preprocessed sessions-list fallback
+    sessions = conversation.get("sessions", [])
+    if sessions and isinstance(sessions, list) and isinstance(sessions[0], dict):
+        result = []
+        for session in sessions:
+            date  = session.get("date", "")
+            lines = [f"=== Session{(' on ' + date) if date else ''} ==="]
+            for turn in session.get("turns", []):
+                if not isinstance(turn, dict):
+                    continue
+                speaker = turn.get("speaker", "?")
+                content = re.sub(r"<[^>]+>", "", turn.get("content", ""))
+                lines.append(f"[{speaker}]: {content}")
+            result.append("\n".join(lines))
+        return result
+
+    # Native LoCoMo format: session_N / session_N_date_time keys
+    conv_field = conversation.get("conversation")
+    if not conv_field or not isinstance(conv_field, dict):
+        return []
+
+    sess_nums = []
+    for k in conv_field:
+        m = re.match(r'^session_(\d+)$', k)
+        if m:
+            sess_nums.append(int(m.group(1)))
+    sess_nums = sorted(set(sess_nums))
+
+    result = []
+    for n in sess_nums:
+        date  = conv_field.get(f"session_{n}_date_time", "")
+        turns = conv_field.get(f"session_{n}", [])
+        lines = [f"=== Session {n}{(' — ' + date) if date else ''} ==="]
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            speaker = turn.get("speaker", "?")
+            text    = re.sub(r"<[^>]+>", "", turn.get("text", ""))
+            lines.append(f"[{speaker}]: {text}")
+        result.append("\n".join(lines))
+    return result
+
+
 # ─── Tensor-parallel validation ───────────────────────────────────────────────
 
 def _valid_tp(model_tag: str, requested: int) -> int:
@@ -341,6 +395,77 @@ def phase1_build_kbs(client, dataset: list):
 
     n_built = len(dataset) - skipped
     log(f"[Phase 1] Done. {n_built} built, {skipped} skipped.")
+
+
+def phase1_build_kbs_persession(client, dataset: list):
+    """
+    ET-S: per-session KB builder.
+
+    Each session in a conversation is atomized with a separate LLM call and the
+    resulting HTML is collected into a single KB.  This avoids the ~82 % compression
+    ratio of the single-call ET approach (23 K-token conversation → 4 096-token output).
+
+    Flow per conversation:
+      session 1 → generate_structured_html() → append to KB root
+      session 2 → generate_structured_html() → append to KB root
+      ...
+      finalize once: assign deterministic IDs, save KB, build hierarchical embeddings
+    """
+    from engramtrace.memory import MemoryManager
+    from bs4 import BeautifulSoup as _BS4
+
+    skipped = 0
+    for conv in tqdm(dataset, desc="  Building ET-S KBs (per-session)"):
+        cid      = conv.get("conversation_id", conv.get("id"))
+        kb_dir   = DATA / "condition_ET-S" / f"conv_{cid}"
+        kb_path  = kb_dir / "knowledge_base.html"
+        tok_path = kb_dir / "kb_token_counts.json"
+
+        if kb_path.exists() and tok_path.exists():
+            skipped += 1
+            continue
+
+        kb_dir.mkdir(parents=True, exist_ok=True)
+        mem = MemoryManager(
+            kb_path                    = str(kb_dir / "knowledge_base.html"),
+            p_embeddings_path          = str(kb_dir / "p_embeddings.json"),
+            structural_embeddings_path = str(kb_dir / "structural_embeddings.json"),
+        )
+
+        sessions = _extract_sessions(conv)
+        if not sessions:
+            log(f"  conv_{cid}: WARNING — no sessions found for ET-S", "WARN")
+            continue
+
+        client.reset_token_counts()
+        n_built_sessions = 0
+        try:
+            root_container = mem.soup.find(id="root") or mem.soup.find("body")
+            for session_text in sessions:
+                if len(session_text.split()) < 20:
+                    log(f"  conv_{cid}: session too short, skipping", "WARN")
+                    continue
+                session_html = client.generate_structured_html(session_text)
+                # Parse and append each top-level node into the KB's root container
+                frag = _BS4(session_html, "lxml")
+                body = frag.find("body") or frag
+                for tag in body.find_all(recursive=False):
+                    if tag.name:
+                        root_container.append(tag.extract())
+                n_built_sessions += 1
+
+            # Finalize once: assign deterministic IDs, persist KB, build hierarchical embeddings
+            active_ids = mem._finalize_and_sync(client, hierarchical=True)
+            counts = client.get_token_counts()
+            tok_path.write_text(json.dumps(counts))
+            log(f"  conv_{cid}: ET-S KB built — {len(active_ids)} p-nodes, "
+                f"{n_built_sessions}/{len(sessions)} sessions, "
+                f"{counts['input_tokens']}→{counts['output_tokens']} tokens")
+        except Exception as e:
+            log(f"  conv_{cid}: ERROR in ET-S build — {e}", "WARN")
+
+    n_total = len(dataset) - skipped
+    log(f"[Phase 1-S] Done. {n_total} built, {skipped} skipped.")
 
 
 # ─── Phase 2 — QA inference ───────────────────────────────────────────────────
@@ -459,30 +584,35 @@ def phase2_qa_inference(client, model_tag: str, qa_pairs: list, dataset: list):
     log(f"[Phase 2] [{model_tag}] Done. {jsonl_line_count(out_path)} answers written.")
 
 
-# ─── Phase 2-R — ET-R: same KB, direct p-node retrieval ──────────────────────
+# ─── Phase 2-R — direct p-node retrieval (ET-R / ET-S-R) ────────────────────
 
-def phase2r_qa_inference(client, model_tag: str, qa_pairs: list, k: int = 5):
+def phase2r_qa_inference(client, model_tag: str, qa_pairs: list, k: int = 5,
+                         kb_condition: str = "ET"):
     """
-    ET-R: same LLM-generated KB as ET, but retrieves p-node snippets directly
-    (like C2/E2) instead of EngramTrace's parent-section context assembly.
+    Direct p-node retrieval from an LLM-generated KB (like C2/E2 flat retrieval).
 
-    This isolates the contribution of LLM-generated HTML structure from
-    EngramTrace's conversational context mechanism.
+    kb_condition selects which KB to read from:
+      "ET"   → condition_ET KBs (single-call atomizer)  → results written as ET-R
+      "ET-S" → condition_ET-S KBs (per-session atomizer) → results written as ET-S-R
+
+    Isolates the contribution of LLM-generated HTML structure from EngramTrace's
+    conversational context mechanism so the two can be compared independently.
     """
     import numpy as np
     from bs4 import BeautifulSoup
     from vllm import SamplingParams
 
-    model_id = MODEL_IDS[model_tag]
-    out_path = RESULTS / "condition_ET-R" / f"{model_tag}.jsonl"
+    result_cond = f"{kb_condition}-R"          # "ET-R" or "ET-S-R"
+    model_id    = MODEL_IDS[model_tag]
+    out_path    = RESULTS / f"condition_{result_cond}" / f"{model_tag}.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     n_done   = jsonl_line_count(out_path)
 
     if n_done == len(qa_pairs):
-        log(f"[Phase 2-R] [{model_tag}] Already complete. Skipping.")
+        log(f"[Phase 2-R] [{model_tag}] {result_cond} already complete. Skipping.")
         return
 
-    log(f"[Phase 2-R] ET-R direct retrieval, {len(qa_pairs)-n_done} remaining...")
+    log(f"[Phase 2-R] {result_cond} direct retrieval, {len(qa_pairs)-n_done} remaining...")
 
     answer_params = SamplingParams(
         temperature=0.0,
@@ -494,7 +624,7 @@ def phase2r_qa_inference(client, model_tag: str, qa_pairs: list, k: int = 5):
     conv_cache: dict = {}
 
     def load_conv(cid: str):
-        kb_dir   = DATA / "condition_ET" / f"conv_{cid}"
+        kb_dir   = DATA / f"condition_{kb_condition}" / f"conv_{cid}"
         emb_path = kb_dir / "p_embeddings.json"
         kb_path  = kb_dir / "knowledge_base.html"
         if not emb_path.exists() or not kb_path.exists():
@@ -585,7 +715,7 @@ def phase2r_qa_inference(client, model_tag: str, qa_pairs: list, k: int = 5):
             out_f.write(json.dumps({
                 "question_id":      qa["question_id"],
                 "conversation_id":  cid,
-                "condition":        "ET-R",
+                "condition":        result_cond,
                 "model":            model_id,
                 "category":         qa["category"],
                 "question":         qa["question"],
@@ -596,7 +726,7 @@ def phase2r_qa_inference(client, model_tag: str, qa_pairs: list, k: int = 5):
                 "inference_ms":     round(elapsed_ms, 1),
             }) + "\n")
 
-    log(f"[Phase 2-R] [{model_tag}] Done. {jsonl_line_count(out_path)} answers written.")
+    log(f"[Phase 2-R] [{model_tag}] {result_cond} done. {jsonl_line_count(out_path)} answers written.")
 
 
 # ─── Phase 3 — Evaluation metrics ────────────────────────────────────────────
@@ -613,7 +743,7 @@ def compute_f1(pred: str, ref: str) -> float:
 
 
 def phase3_evaluate(model_tags: list):
-    """Compute F1, BLEU-1, ROUGE-L, ROUGE-2, METEOR, SBERT-sim for condition ET."""
+    """Compute F1, BLEU-1, ROUGE-L, ROUGE-2, METEOR, SBERT-sim for ET conditions."""
     from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
     from nltk.translate.meteor_score import meteor_score
     from rouge_score import rouge_scorer as rouge_lib
@@ -625,7 +755,7 @@ def phase3_evaluate(model_tags: list):
     smooth = SmoothingFunction().method1
 
     for model_tag in model_tags:
-        for cond_tag in ["ET", "ET-R"]:
+        for cond_tag in ["ET", "ET-R", "ET-S", "ET-S-R"]:
             out_path  = RESULTS / f"condition_{cond_tag}" / f"{model_tag}.jsonl"
             eval_path = EVAL / "scores" / f"{cond_tag}_{model_tag}.jsonl"
 
@@ -662,20 +792,141 @@ def phase3_evaluate(model_tags: list):
             log(f"  [{model_tag}] {cond_tag} evaluation done. {len(scored)} records.")
 
 
+# ─── Phase 3b — LLM-as-judge ─────────────────────────────────────────────────
+
+def _parse_verdict(text: str) -> int:
+    t = text.strip().lower()
+    if "incorrect" in t and "correct" not in t.replace("incorrect", ""):
+        return 0
+    return 1 if "correct" in t else 0
+
+
+def phase3b_llm_judge(model_tags: list, tensor_parallel_size: int = 1,
+                      gpu_memory_utilization: float = 0.90):
+    """
+    Judges ET/ET-R/ET-S/ET-S-R answers with Qwen2.5-7B as evaluator.
+
+    Each record is scored 1 (Correct) or 0 (Incorrect) and the verdict is
+    written back into the results JSONL file under the 'llm_judge' key.
+    Resume-safe: records with an existing verdict are skipped.
+    Runs in the orchestrator after all inference subprocesses have exited,
+    so all GPUs are free.
+    """
+    from vllm import LLM, SamplingParams
+
+    et_conds = ["ET", "ET-R", "ET-S", "ET-S-R"]
+    any_exist = any(
+        (RESULTS / f"condition_{c}" / f"{m}.jsonl").exists()
+        for c in et_conds for m in model_tags
+    )
+    if not any_exist:
+        log("[Phase 3b] No ET results found to judge. Skipping.")
+        return
+
+    log(f"[Phase 3b] Loading Qwen2.5-7B judge (tp={tensor_parallel_size})...")
+    judge_llm = LLM(
+        model=MODEL_IDS["7B"],
+        dtype="bfloat16",
+        tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        enforce_eager=False,
+        distributed_executor_backend="mp",
+    )
+    judge_params = SamplingParams(temperature=0.0, max_tokens=10)
+
+    for cond in et_conds:
+        for model_tag in model_tags:
+            path = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
+            if not path.exists():
+                continue
+            records = [json.loads(l) for l in path.open()]
+            if all(r.get("llm_judge") is not None for r in records):
+                log(f"  [Phase 3b] {cond}/{model_tag}: already judged, skipping")
+                continue
+
+            pending = [(i, r) for i, r in enumerate(records) if r.get("llm_judge") is None]
+            log(f"  [Phase 3b] {cond}/{model_tag}: judging {len(pending)} records...")
+
+            prompts = [
+                "You are evaluating whether a predicted answer correctly answers a question.\n\n"
+                f"Question: {r['question']}\n"
+                f"Reference Answer: {r['reference_answer']}\n"
+                f"Predicted Answer: {r['predicted_answer']}\n\n"
+                "Does the predicted answer correctly answer the question? "
+                "It is correct if it captures the key information, even if worded differently.\n"
+                "Reply with exactly one word: Correct or Incorrect."
+                for _, r in pending
+            ]
+            outputs = judge_llm.generate(prompts, judge_params)
+            for (i, _), out in zip(pending, outputs):
+                records[i]["llm_judge"] = _parse_verdict(out.outputs[0].text)
+
+            with path.open("w") as f:
+                for r in records:
+                    f.write(json.dumps(r) + "\n")
+
+            n_ok = sum(r.get("llm_judge", 0) for r in records)
+            log(f"  [Phase 3b] {cond}/{model_tag}: {n_ok}/{len(records)} correct "
+                f"({100*n_ok/len(records):.1f}%)")
+
+    try:
+        judge_llm.llm_engine.shutdown()
+    except Exception:
+        pass
+    del judge_llm
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+        time.sleep(5)
+        gc.collect()
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    log("[Phase 3b] Judging complete.")
+
+
+def _load_judge_scores(conds: list, model_tags: list) -> dict:
+    """
+    Load mean llm_judge accuracy (float 0-1) keyed by (cond, model_tag).
+    Reads from results JSONL files directly — works for any condition including
+    A-E2 (judged by run_experiment.py) and ET/ET-S (judged by phase3b here).
+    Returns only conditions where at least one verdict exists.
+    """
+    out = {}
+    for cond in conds:
+        for model_tag in model_tags:
+            path = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
+            if not path.exists():
+                continue
+            vals = []
+            for line in path.open():
+                try:
+                    r = json.loads(line)
+                    v = r.get("llm_judge")
+                    if v is not None:
+                        vals.append(int(v))
+                except Exception:
+                    pass
+            if vals:
+                out[(cond, model_tag)] = sum(vals) / len(vals)
+    return out
+
+
 # ─── Phase 4 — Report ────────────────────────────────────────────────────────
 
-def _load_et_token_totals(model_tags: list) -> dict:
+def _load_et_token_totals(model_tags: list, kb_cond: str = "ET") -> dict:
     """
-    Returns per-model token breakdown:
+    Returns per-model token breakdown for a given KB condition (ET or ET-S):
       phase1_in/out : total KB-structuring LLM tokens (all 10 conversations)
       phase1_per_qa : phase1_in amortized over n_qa (per-question setup cost)
-      phase2_in/out : total QA-response LLM tokens
+      phase2_in/out : total QA-response LLM tokens (full Brain inference)
       phase2_avg_in : mean input tokens per QA pair (runtime cost per question)
       n_qa, n_convs
     """
     totals = {}
     for model_tag in model_tags:
-        tok_files = list((DATA / "condition_ET").glob("conv_*/kb_token_counts.json"))
+        tok_files = list((DATA / f"condition_{kb_cond}").glob("conv_*/kb_token_counts.json"))
         p1_in = p1_out = 0
         for tok_file in tok_files:
             try:
@@ -686,7 +937,7 @@ def _load_et_token_totals(model_tags: list) -> dict:
                 pass
 
         p2_in = p2_out = n_qa = 0
-        res_path = RESULTS / "condition_ET" / f"{model_tag}.jsonl"
+        res_path = RESULTS / f"condition_{kb_cond}" / f"{model_tag}.jsonl"
         if res_path.exists():
             for line in res_path.open():
                 try:
@@ -744,9 +995,10 @@ def phase4_report(model_tags: list):
     """Build per-category tables and three-view token efficiency analysis."""
     log("[Phase 4] Generating report...")
 
+    et_conds = ["ET", "ET-R", "ET-S", "ET-S-R"]
     rows_et = []
     for model_tag in model_tags:
-        for cond_tag in ["ET", "ET-R"]:
+        for cond_tag in et_conds:
             eval_path = EVAL / "scores" / f"{cond_tag}_{model_tag}.jsonl"
             if not eval_path.exists():
                 continue
@@ -759,12 +1011,12 @@ def phase4_report(model_tags: list):
         log("[Phase 4] No evaluated results found.", "WARN")
         return
 
-    df           = pd.DataFrame(rows_et)
-    token_totals = _load_et_token_totals(model_tags)
+    df             = pd.DataFrame(rows_et)
+    token_totals   = _load_et_token_totals(model_tags, kb_cond="ET")
+    token_totals_s = _load_et_token_totals(model_tags, kb_cond="ET-S")
 
     other_conds  = ["A", "B", "C", "C2", "D", "E", "E2"]
-    # Also load ET-R per-QA token averages for efficiency comparison
-    other_tokens = _load_other_avg_tokens(model_tags, other_conds + ["ET-R"])
+    other_tokens = _load_other_avg_tokens(model_tags, other_conds + ["ET-R", "ET-S-R"])
 
     # ── Load all condition rows for F1 table ──────────────────────────────
     all_rows = list(rows_et)
@@ -783,12 +1035,12 @@ def phase4_report(model_tags: list):
     metric_cols = ["f1", "bleu1", "rougeL", "rouge2", "meteor", "sbert_sim"]
 
     print("\n" + "=" * 72)
-    print("EngramTrace (ET) — LoCoMo Results")
+    print("EngramTrace (ET / ET-S) — LoCoMo Results")
     print("=" * 72)
 
     # ── Per-category accuracy ─────────────────────────────────────────────
     for model_tag in model_tags:
-        for cond_tag in ["ET", "ET-R"]:
+        for cond_tag in et_conds:
             sub = df[(df["model_tag"] == model_tag) & (df["condition"] == cond_tag)]
             if sub.empty:
                 continue
@@ -816,22 +1068,25 @@ def phase4_report(model_tags: list):
         if sub.empty:
             continue
         t      = token_totals.get(model_tag, {})
-        n_qa   = t.get("n_qa", max(len(sub), 1))
-        mean_f1 = sub["f1"].mean()
+        ts     = token_totals_s.get(model_tag, {})
+        n_qa   = t.get("n_qa", max(len(sub), 1)) or ts.get("n_qa", max(len(sub), 1))
 
-        p1_per_qa   = t.get("phase1_per_qa",   0)   # KB build cost amortized
-        p2_avg      = t.get("phase2_avg_in",    0)   # avg QA inference cost
-        total_amort = p1_per_qa + p2_avg             # true total per-QA cost
+        et_sub  = df[(df["model_tag"] == model_tag) & (df["condition"] == "ET")]
+        mean_f1 = et_sub["f1"].mean() if not et_sub.empty else float("nan")
 
-        print(f"\n  Model: {model_tag}  |  F1 = {mean_f1:.4f}  |  n_qa = {n_qa:,}")
+        p1_per_qa   = t.get("phase1_per_qa",  0)
+        p2_avg      = t.get("phase2_avg_in",  0)
+        total_amort = p1_per_qa + p2_avg
+
+        p1s_per_qa  = ts.get("phase1_per_qa", 0)   # ET-S KB build cost amortized
+
+        print(f"\n  Model: {model_tag}  |  n_qa = {n_qa:,}")
 
         # ── View 1: QA Inference cost only (Phase 2) ──────────────────────
-        # Comparable to other conditions' token counts (they have no Phase 1).
         print(f"\n  View 1 — QA Inference Cost (Phase 2 only, runtime per question)")
-        print(f"  {'Cond':<6} {'Avg Input/QA':>14} {'F1':>8} {'F1/1k':>9}  note")
-        print(f"  " + "-" * 55)
+        print(f"  {'Cond':<8} {'Avg Input/QA':>14} {'F1':>8} {'F1/1k':>9}  note")
+        print(f"  " + "-" * 58)
 
-        # Other conditions (all their cost is QA-time)
         for cond in other_conds:
             avg_tok  = other_tokens.get((cond, model_tag))
             cond_f1s = df_all[(df_all["condition"] == cond) &
@@ -840,54 +1095,58 @@ def phase4_report(model_tags: list):
                 continue
             cf1 = cond_f1s.mean()
             f1k = cf1 / (avg_tok / 1000) if avg_tok > 0 else float("nan")
-            print(f"  {cond:<6} {avg_tok:>14,.1f} {cf1:>8.4f} {f1k:>9.4f}")
+            print(f"  {cond:<8} {avg_tok:>14,.1f} {cf1:>8.4f} {f1k:>9.4f}")
 
-        # ET — Phase 2 only (excludes KB build cost)
-        f1k_p2 = mean_f1 / (p2_avg / 1000) if p2_avg > 0 else float("nan")
-        print(f"  {'ET*':<6} {p2_avg:>14,.1f} {mean_f1:>8.4f} {f1k_p2:>9.4f}"
-              f"  * Phase 2 only; KB build excluded")
+        # ET — Phase 2 only
+        if not et_sub.empty and p2_avg > 0:
+            f1k_p2 = mean_f1 / (p2_avg / 1000)
+            print(f"  {'ET*':<8} {p2_avg:>14,.1f} {mean_f1:>8.4f} {f1k_p2:>9.4f}"
+                  f"  * Phase 2 only; KB build excluded")
 
-        # ET-R — direct retrieval on same KB (no EngramTrace context assembly)
+        # ET-R — direct retrieval on single-call KB
         etr_sub = df[(df["model_tag"] == model_tag) & (df["condition"] == "ET-R")]
         if not etr_sub.empty:
             etr_f1   = etr_sub["f1"].mean()
             etr_toks = other_tokens.get(("ET-R", model_tag), 0)
             etr_f1k  = etr_f1 / (etr_toks / 1000) if etr_toks > 0 else float("nan")
-            print(f"  {'ET-R†':<6} {etr_toks:>14,.1f} {etr_f1:>8.4f} {etr_f1k:>9.4f}"
-                  f"  † same KB; direct p-node retrieval (no parent sections)")
+            print(f"  {'ET-R†':<8} {etr_toks:>14,.1f} {etr_f1:>8.4f} {etr_f1k:>9.4f}"
+                  f"  † single-call KB; direct p-node retrieval")
 
-        # ── View 2: KB Structuring cost (Phase 1, ET-specific) ────────────
+        # ET-S-R — direct retrieval on per-session KB
+        etsr_sub = df[(df["model_tag"] == model_tag) & (df["condition"] == "ET-S-R")]
+        if not etsr_sub.empty:
+            etsr_f1   = etsr_sub["f1"].mean()
+            etsr_toks = other_tokens.get(("ET-S-R", model_tag), 0)
+            etsr_f1k  = etsr_f1 / (etsr_toks / 1000) if etsr_toks > 0 else float("nan")
+            print(f"  {'ET-S-R‡':<8} {etsr_toks:>14,.1f} {etsr_f1:>8.4f} {etsr_f1k:>9.4f}"
+                  f"  ‡ per-session KB; direct p-node retrieval")
+
+        # ── View 2: KB Structuring cost (Phase 1) ─────────────────────────
         print(f"\n  View 2 — KB Structuring Cost (Phase 1, paid once per conversation)")
-        n_convs       = t.get("n_convs", 10)
-        p1_total      = t.get("phase1_in", 0)
-        p1_per_conv   = p1_total / n_convs if n_convs else 0
-        print(f"  Total Phase-1 input tokens    : {p1_total:>12,}")
-        print(f"  Avg per conversation          : {p1_per_conv:>12,.1f}")
-        print(f"  Amortized per QA pair         : {p1_per_qa:>12,.1f}")
-        print(f"  C2/E2 equivalent cost         : {'0':>12}  (template-based, no LLM)")
-        print(f"  A equivalent cost (per QA)    : "
-              f"{other_tokens.get(('A', model_tag), 0):>12,.1f}  "
-              f"(paid every single question)")
-        print(f"  Break-even vs A               : "
-              f"{'always' if p1_total > 0 else 'n/a':>12}"
-              f"  (ET total < A total even at n_qa=1)")
-        if p2_avg > 0:
-            c2_avg = other_tokens.get(("C2", model_tag), 0)
-            if c2_avg and p2_avg > c2_avg:
-                # ET per-QA cost > C2 per-QA cost; extra cost = p2_avg - c2_avg per QA
-                extra_per_qa = p2_avg - c2_avg
-                breakeven_n  = p1_per_qa / extra_per_qa if extra_per_qa > 0 else float("inf")
-                print(f"  Break-even vs C2 (QA count)  : "
-                      f"{breakeven_n:>12.0f}  (ET amort total = C2 total after this many QAs)")
-            else:
-                print(f"  Break-even vs C2              : {'n/a':>12}  (ET Phase-2 ≤ C2)")
+        print(f"  {'Cond':<8} {'Total P1 tokens':>16} {'Per conv':>10} {'Amort/QA':>10}")
+        print(f"  " + "-" * 48)
+
+        p1_total    = t.get("phase1_in",  0)
+        p1s_total   = ts.get("phase1_in", 0)
+        n_convs     = t.get("n_convs",  10)
+        n_convs_s   = ts.get("n_convs", 10)
+
+        if p1_total:
+            p1_per_conv = p1_total / n_convs if n_convs else 0
+            print(f"  {'ET':<8} {p1_total:>16,} {p1_per_conv:>10,.1f} {p1_per_qa:>10,.1f}")
+        if p1s_total:
+            p1s_per_conv = p1s_total / n_convs_s if n_convs_s else 0
+            print(f"  {'ET-S':<8} {p1s_total:>16,} {p1s_per_conv:>10,.1f} {p1s_per_qa:>10,.1f}")
+        print(f"  {'C2/E2':<8} {'0':>16} {'0':>10} {'0':>10}  (template-based)")
+        a_avg = other_tokens.get(("A", model_tag), 0)
+        if a_avg:
+            print(f"  {'A':<8} {'(per QA)':>16} {a_avg:>10,.1f} {a_avg:>10,.1f}  (no KB; paid every Q)")
 
         # ── View 3: Total amortized cost ──────────────────────────────────
         print(f"\n  View 3 — Total Amortized Cost (Phase 1 + Phase 2, per QA pair)")
-        print(f"  This is the honest comparison when running the full benchmark.")
-        print(f"  {'Cond':<6} {'Phase1/QA':>10} {'Phase2/QA':>10} {'Total/QA':>10} "
+        print(f"  {'Cond':<8} {'Phase1/QA':>10} {'Phase2/QA':>10} {'Total/QA':>10} "
               f"{'F1':>8} {'F1/1k(total)':>13}")
-        print(f"  " + "-" * 60)
+        print(f"  " + "-" * 62)
 
         for cond in other_conds:
             avg_tok  = other_tokens.get((cond, model_tag))
@@ -897,22 +1156,29 @@ def phase4_report(model_tags: list):
                 continue
             cf1 = cond_f1s.mean()
             f1k = cf1 / (avg_tok / 1000) if avg_tok > 0 else float("nan")
-            print(f"  {cond:<6} {'0':>10} {avg_tok:>10,.1f} {avg_tok:>10,.1f} "
+            print(f"  {cond:<8} {'0':>10} {avg_tok:>10,.1f} {avg_tok:>10,.1f} "
                   f"{cf1:>8.4f} {f1k:>13.4f}")
 
-        f1k_total = mean_f1 / (total_amort / 1000) if total_amort > 0 else float("nan")
-        print(f"  {'ET':<6} {p1_per_qa:>10,.1f} {p2_avg:>10,.1f} {total_amort:>10,.1f} "
-              f"{mean_f1:>8.4f} {f1k_total:>13.4f}")
+        if not et_sub.empty and total_amort > 0:
+            f1k_total = mean_f1 / (total_amort / 1000)
+            print(f"  {'ET':<8} {p1_per_qa:>10,.1f} {p2_avg:>10,.1f} {total_amort:>10,.1f} "
+                  f"{mean_f1:>8.4f} {f1k_total:>13.4f}")
 
-        # ET-R: same Phase 1 cost, but much cheaper Phase 2
-        etr_sub = df[(df["model_tag"] == model_tag) & (df["condition"] == "ET-R")]
         if not etr_sub.empty:
-            etr_f1      = etr_sub["f1"].mean()
-            etr_p2_avg  = other_tokens.get(("ET-R", model_tag), 0)
-            etr_total   = p1_per_qa + etr_p2_avg
-            etr_f1k     = etr_f1 / (etr_total / 1000) if etr_total > 0 else float("nan")
-            print(f"  {'ET-R':<6} {p1_per_qa:>10,.1f} {etr_p2_avg:>10,.1f} {etr_total:>10,.1f} "
+            etr_f1     = etr_sub["f1"].mean()
+            etr_p2_avg = other_tokens.get(("ET-R", model_tag), 0)
+            etr_total  = p1_per_qa + etr_p2_avg
+            etr_f1k    = etr_f1 / (etr_total / 1000) if etr_total > 0 else float("nan")
+            print(f"  {'ET-R':<8} {p1_per_qa:>10,.1f} {etr_p2_avg:>10,.1f} {etr_total:>10,.1f} "
                   f"{etr_f1:>8.4f} {etr_f1k:>13.4f}")
+
+        if not etsr_sub.empty:
+            etsr_f1     = etsr_sub["f1"].mean()
+            etsr_p2_avg = other_tokens.get(("ET-S-R", model_tag), 0)
+            etsr_total  = p1s_per_qa + etsr_p2_avg
+            etsr_f1k    = etsr_f1 / (etsr_total / 1000) if etsr_total > 0 else float("nan")
+            print(f"  {'ET-S-R':<8} {p1s_per_qa:>10,.1f} {etsr_p2_avg:>10,.1f} {etsr_total:>10,.1f} "
+                  f"{etsr_f1:>8.4f} {etsr_f1k:>13.4f}")
 
     # ── F1 comparison table ───────────────────────────────────────────────
     if len(df_all) > len(df):
@@ -920,19 +1186,24 @@ def phase4_report(model_tags: list):
         print("F1 Comparison (Overall)")
         print("─" * 72)
         pivot = df_all.groupby(["condition", "model_tag"])["f1"].mean().unstack("model_tag")
-        pivot = pivot.reindex([c for c in other_conds + [CONDITION, "ET-R"] if c in pivot.index])
+        cond_order = other_conds + [CONDITION, "ET-R", "ET-S", "ET-S-R"]
+        pivot = pivot.reindex([c for c in cond_order if c in pivot.index])
         print(pivot.to_string(float_format="%.4f"))
 
         print("\n── Statistical Tests (paired t-test on F1) ──")
-        for cond_a, cond_b, label in [
-            ("ET",   "B",    "flat RAG"),
-            ("ET",   "C2",   "hier. XML RAG"),
-            ("ET",   "E2",   "hier. HTML RAG"),
-            ("ET-R", "B",    "ET-R vs flat RAG"),
-            ("ET-R", "C2",   "ET-R vs hier. XML RAG"),
-            ("ET-R", "E2",   "ET-R vs hier. HTML RAG"),
-            ("ET-R", "ET",   "ET-R vs full EngramTrace"),
-        ]:
+        test_pairs = [
+            ("ET",     "B",      "vs flat RAG"),
+            ("ET",     "C2",     "vs hier. XML RAG"),
+            ("ET",     "E2",     "vs hier. HTML RAG"),
+            ("ET-R",   "B",      "vs flat RAG"),
+            ("ET-R",   "C2",     "vs hier. XML RAG"),
+            ("ET-R",   "E2",     "vs hier. HTML RAG"),
+            ("ET-R",   "ET",     "vs full EngramTrace"),
+            ("ET-S-R", "ET-R",   "per-session vs single-call KB"),
+            ("ET-S-R", "C2",     "per-session vs hier. XML RAG"),
+            ("ET-S-R", "E2",     "per-session vs hier. HTML RAG"),
+        ]
+        for cond_a, cond_b, label in test_pairs:
             for model_tag in model_tags:
                 a_f1 = df_all[(df_all["condition"] == cond_a) &
                                (df_all["model_tag"] == model_tag)]["f1"].values
@@ -945,8 +1216,67 @@ def phase4_report(model_tags: list):
                 _, p = stats.ttest_rel(a_f1[:n], b_f1[:n])
                 d    = diff.mean() / diff.std() if diff.std() > 0 else float("nan")
                 sig  = "**" if p < 0.05 else "(~)" if p < 0.10 else ""
-                print(f"  [{model_tag}] ET vs {cond_b} ({label}): "
+                print(f"  [{model_tag}] {cond_a} {label}: "
                       f"ΔF1={diff.mean():+.4f}  p={p:.3f}{sig}  d={d:.3f}")
+
+    # ── LLM Judge Accuracy ───────────────────────────────────────────────
+    all_conds_for_judge = ["A", "B", "C", "C2", "D", "E", "E2",
+                           "ET", "ET-R", "ET-S", "ET-S-R"]
+    judge_scores = _load_judge_scores(all_conds_for_judge, model_tags)
+
+    if judge_scores:
+        print("\n" + "─" * 72)
+        print("LLM JUDGE ACCURACY  (Qwen2.5-7B  ·  Correct=1 / Incorrect=0)")
+        print("─" * 72)
+
+        # Overall accuracy table
+        print(f"  {'Cond':<10}" + "".join(f"  {m:>8}" for m in model_tags))
+        print("  " + "-" * (10 + 10 * len(model_tags)))
+        for cond in all_conds_for_judge:
+            row_vals = [judge_scores.get((cond, m)) for m in model_tags]
+            if all(v is None for v in row_vals):
+                continue
+            row = f"  {cond:<10}"
+            for v in row_vals:
+                row += f"  {v:>8.4f}" if v is not None else f"  {'—':>8}"
+            print(row)
+
+        # Per-category breakdown for ET conditions only
+        et_judge_conds = [c for c in ["ET", "ET-R", "ET-S", "ET-S-R"]
+                          if any((RESULTS / f"condition_{c}" / f"{m}.jsonl").exists()
+                                 for m in model_tags)]
+        if et_judge_conds:
+            print("\n  Per-category LLM judge (ET conditions):")
+            for model_tag in model_tags:
+                header_printed = False
+                for cond in et_judge_conds:
+                    path = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
+                    if not path.exists():
+                        continue
+                    records = []
+                    for line in path.open():
+                        try:
+                            r = json.loads(line)
+                            if r.get("llm_judge") is not None:
+                                records.append(r)
+                        except Exception:
+                            pass
+                    if not records:
+                        continue
+                    if not header_printed:
+                        print(f"\n  Model: {model_tag}")
+                        print(f"  {'Cond':<10}" +
+                              "".join(f"  {cat:<14}" for cat in CATEGORIES))
+                        header_printed = True
+                    row = f"  {cond:<10}"
+                    for cat in CATEGORIES:
+                        cat_recs = [r for r in records if r.get("category") == cat]
+                        if cat_recs:
+                            acc = sum(r["llm_judge"] for r in cat_recs) / len(cat_recs)
+                            row += f"  {acc:<14.4f}"
+                        else:
+                            row += f"  {'—':<14}"
+                    print(row)
 
     print("\n" + "=" * 72)
 
@@ -975,6 +1305,16 @@ def parse_args():
                    help="Skip Phase 2 QA inference (re-evaluate existing answers)")
     p.add_argument("--skip-qa-r",    action="store_true",
                    help="Skip Phase 2-R ET-R direct retrieval inference")
+    p.add_argument("--per-session",   action="store_true",
+                   help="Also build per-session KB (ET-S) and run ET-S-R direct retrieval")
+    p.add_argument("--skip-build-s",  action="store_true",
+                   help="Skip Phase 1-S ET-S per-session KB building (use existing ET-S KBs)")
+    p.add_argument("--skip-qa-r-s",   action="store_true",
+                   help="Skip Phase 2-R ET-S-R direct retrieval inference")
+    p.add_argument("--skip-judge",    action="store_true",
+                   help="Skip Phase 3b LLM-as-judge scoring")
+    p.add_argument("--judge-tp",      type=int, default=1,
+                   help="Tensor-parallel size for the judge model (default: 1)")
     p.add_argument("--inference-only", action="store_true",
                    help="INTERNAL: run one model's phases 1+2 then exit (subprocess mode)")
     return p.parse_args()
@@ -1005,8 +1345,16 @@ def main():
 
         # Load vLLM ONCE for both phases — avoids CUDA worker leak between loads.
         # (Phase 1 and Phase 2 share the same LocalLLMClient instance.)
-        need_llm = (not args.skip_build) or (not args.skip_qa) or (not args.skip_qa_r)
-        client   = None
+        run_build_s   = args.per_session and not args.skip_build_s
+        run_qa_r_s    = args.per_session and not args.skip_qa_r_s
+        need_llm = (
+            (not args.skip_build)
+            or (not args.skip_qa)
+            or (not args.skip_qa_r)
+            or run_build_s
+            or run_qa_r_s
+        )
+        client = None
 
         if need_llm:
             log(f"[Subprocess {model_tag}] Loading models...")
@@ -1016,11 +1364,18 @@ def main():
             log(f"[Phase 1] Building EngramTrace KBs...")
             phase1_build_kbs(client, dataset)
 
+        if run_build_s:
+            log(f"[Phase 1-S] Building per-session ET-S KBs...")
+            phase1_build_kbs_persession(client, dataset)
+
         if not args.skip_qa:
             phase2_qa_inference(client, model_tag, qa_pairs, dataset)
 
         if not args.skip_qa_r:
-            phase2r_qa_inference(client, model_tag, qa_pairs)
+            phase2r_qa_inference(client, model_tag, qa_pairs, kb_condition="ET")
+
+        if run_qa_r_s:
+            phase2r_qa_inference(client, model_tag, qa_pairs, kb_condition="ET-S")
 
         return
 
@@ -1042,8 +1397,21 @@ def main():
         if et_res_r.exists():
             shutil.rmtree(et_res_r)
             log("Rebuilt: removed results/condition_ET-R")
+        et_dir_s = DATA / "condition_ET-S"
+        if et_dir_s.exists():
+            shutil.rmtree(et_dir_s)
+            log("Rebuilt: removed data/condition_ET-S")
+        et_res_s = RESULTS / "condition_ET-S"
+        if et_res_s.exists():
+            shutil.rmtree(et_res_s)
+            log("Rebuilt: removed results/condition_ET-S")
+        et_res_sr = RESULTS / "condition_ET-S-R"
+        if et_res_sr.exists():
+            shutil.rmtree(et_res_sr)
+            log("Rebuilt: removed results/condition_ET-S-R")
         et_scores = EVAL / "scores"
-        for f in list(et_scores.glob("ET_*.jsonl")) + list(et_scores.glob("ET-R_*.jsonl")):
+        for f in (list(et_scores.glob("ET_*.jsonl")) + list(et_scores.glob("ET-R_*.jsonl"))
+                  + list(et_scores.glob("ET-S_*.jsonl")) + list(et_scores.glob("ET-S-R_*.jsonl"))):
             f.unlink()
             log(f"Rebuilt: removed {f.name}")
         ensure_dirs()
@@ -1065,6 +1433,12 @@ def main():
             cmd.append("--skip-qa")
         if args.skip_qa_r:
             cmd.append("--skip-qa-r")
+        if args.per_session:
+            cmd.append("--per-session")
+        if args.skip_build_s:
+            cmd.append("--skip-build-s")
+        if args.skip_qa_r_s:
+            cmd.append("--skip-qa-r-s")
 
         ret = _sp.run(cmd, check=False)
         if ret.returncode != 0:
@@ -1074,6 +1448,8 @@ def main():
 
     # ── Phase 3 & 4: metrics and report (CPU, runs in orchestrator process) ──
     phase3_evaluate(args.models)
+    if not args.skip_judge:
+        phase3b_llm_judge(args.models, tensor_parallel_size=args.judge_tp)
     phase4_report(args.models)
 
 

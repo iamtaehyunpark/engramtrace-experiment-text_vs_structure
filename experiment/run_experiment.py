@@ -1094,7 +1094,13 @@ def phase4b_llm_judge(model_and_tok=None,
 
     judge_params = SamplingParams(temperature=0.0, max_tokens=10)
 
-    for cond in CONDITIONS:
+    # Judge all conditions: A-E2 plus ET/ET-S variants if their results exist.
+    et_conds    = ["ET", "ET-R", "ET-S", "ET-S-R"]
+    all_conds   = CONDITIONS + [c for c in et_conds
+                                 if any((RESULTS / f"condition_{c}" / f"{m}.jsonl").exists()
+                                        for m in MODELS)]
+
+    for cond in all_conds:
         for model_tag in MODELS:
             path = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
             if not path.exists():
@@ -1222,6 +1228,36 @@ def phase5_report(df: pd.DataFrame, llm_7b=None):
             narrative,
         ]
 
+    # ── ET / ET-S LLM judge scores (if available) ────────────────────────
+    et_judge_conds = ["ET", "ET-R", "ET-S", "ET-S-R"]
+    et_judge_rows = []
+    for cond in et_judge_conds:
+        for model_tag in MODELS:
+            path = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
+            if not path.exists():
+                continue
+            vals = []
+            for line in path.open():
+                try:
+                    r = json.loads(line)
+                    v = r.get("llm_judge")
+                    if v is not None:
+                        vals.append(int(v))
+                except Exception:
+                    pass
+            if vals:
+                et_judge_rows.append(f"  {cond:<8}  [{model_tag}]  "
+                                     f"{sum(vals)/len(vals):.4f}  "
+                                     f"({sum(vals)}/{len(vals)} correct)")
+
+    if et_judge_rows:
+        report_lines += [
+            "",
+            "─" * 70,
+            "LLM JUDGE — EngramTrace Conditions (Qwen2.5-7B)",
+            "─" * 70,
+        ] + et_judge_rows
+
     report_lines += [
         "",
         "─" * 70,
@@ -1251,8 +1287,8 @@ def phase5_report(df: pd.DataFrame, llm_7b=None):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu", choices=["h200x4", "a100x2", "a100x4", "a100x8", "a6000x4"], default="h200x4",
-                        help="GPU profile: h200x4 (default), a100x2, a100x4, a100x8, a6000x4")
+    parser.add_argument("--gpu", choices=["h200x1", "h200x2", "h200x4", "a100x2", "a100x4", "a100x8", "a6000x4"], default="h200x4",
+                        help="GPU profile: h200x1/x2/x4, a100x2/x4/x8, a6000x4")
     parser.add_argument("--models", nargs="+", choices=["72B", "7B"], default=["72B", "7B"],
                         help="Which models to run (default: both)")
     parser.add_argument("--rebuild", action="store_true",
@@ -1267,16 +1303,19 @@ def main():
     if args_cli.gpu == "a100x8":
         TP  = 8
         MEM = 0.90
-    elif args_cli.gpu == "a100x4":
+    elif args_cli.gpu in ("a100x4", "h200x4"):
         TP  = 4
         MEM = 0.90
-    elif args_cli.gpu == "a100x2":
+    elif args_cli.gpu in ("a100x2", "h200x2"):
         TP  = 2
-        MEM = 0.95
+        MEM = 0.90
     elif args_cli.gpu == "a6000x4":
         TP  = 4
         MEM = 0.90
-    else:  # h200x4
+    elif args_cli.gpu == "h200x1":
+        TP  = 1
+        MEM = 0.90
+    else:  # fallback
         TP  = 4
         MEM = 0.90
 

@@ -29,10 +29,11 @@ STRUCTURE RULES:
 2. ALL content must be strictly nested inside its semantic parent. Wrap each heading and ALL of its associated content (<p>, <ul>, <ol>, <table>, etc.) in a <section> tag. Nest sections hierarchically: h3-sections inside h2-sections inside h1-sections. Nothing should float as an orphan sibling of a heading it belongs to.
 3. Each <p> tag must contain exactly one coherent concept or fact. This is critical — downstream systems use individual <p> tags as atomic retrieval units for semantic search. Break large blocks into multiple <p> tags.
 4. Lists (<ul>/<ol>) belong inside the <section> of the heading they relate to, after any introductory <p> tag.
-5. Preserve all original content and its semantic meaning. Do not omit or summarize.
-6. When contradictions exist in the source text, keep the latest version.
-7. Do NOT add id attributes. The engine assigns deterministic IDs automatically.
-8. Return only clean HTML markup. No markdown, no code fences."""
+5. Preserve ALL facts, names, dates, numbers, and specific details VERBATIM inside <p> tags. Do not paraphrase, rephrase, or merge distinct statements. Structure and hierarchy only — never alter the words.
+6. Do not omit any information. Every fact from the source must appear in the output.
+7. When contradictions exist in the source text, keep the latest version.
+8. Do NOT add id attributes. The engine assigns deterministic IDs automatically.
+9. Return only clean HTML markup. No markdown, no code fences."""
 
 _SYSTEM_HTML_COMPRESS = """\
 You are restructuring an existing HTML knowledge base for long-term storage efficiency.
