@@ -968,6 +968,13 @@ def _load_et_token_totals(model_tags: list, kb_cond: str = "ET") -> dict:
                 except Exception:
                     pass
 
+        # ET-S has no full Brain inference results (only ET-S-R retrieval exists).
+        # Fall back to ET-S-R result count so Phase 1 cost is amortized correctly.
+        if n_qa == 0 and kb_cond == "ET-S":
+            fallback = RESULTS / "condition_ET-S-R" / f"{model_tag}.jsonl"
+            if fallback.exists():
+                n_qa = sum(1 for _ in fallback.open())
+
         totals[model_tag] = {
             "phase1_in":     p1_in,
             "phase1_out":    p1_out,
@@ -1298,6 +1305,37 @@ def phase4_report(model_tags: list):
                             row += f"  {'—':<14}"
                     print(row)
 
+    # ── Key Findings Summary ──────────────────────────────────────────────
+    print("\n" + "─" * 72)
+    print("KEY FINDINGS SUMMARY")
+    print("─" * 72)
+    for model_tag in model_tags:
+        et_sub   = df[(df["model_tag"] == model_tag) & (df["condition"] == "ET")]
+        etr_sub  = df[(df["model_tag"] == model_tag) & (df["condition"] == "ET-R")]
+        etsr_sub = df[(df["model_tag"] == model_tag) & (df["condition"] == "ET-S-R")]
+        if et_sub.empty and etsr_sub.empty:
+            continue
+        print(f"\n  [{model_tag}]")
+        for cond, sub in [("ET", et_sub), ("ET-R", etr_sub), ("ET-S-R", etsr_sub)]:
+            if sub.empty:
+                continue
+            f1  = sub["f1"].mean()
+            jsc = judge_scores.get((cond, model_tag))
+            j   = f"{jsc:.4f}" if jsc is not None else "—"
+            print(f"    {cond:<8}  F1={f1:.4f}  Judge={j}")
+        if not etsr_sub.empty and not etr_sub.empty:
+            delta_f1 = etsr_sub["f1"].mean() - etr_sub["f1"].mean()
+            j_etr  = judge_scores.get(("ET-R",   model_tag), 0)
+            j_etsr = judge_scores.get(("ET-S-R", model_tag), 0)
+            delta_j = j_etsr - j_etr
+            print(f"    ET-S-R vs ET-R  ΔF1={delta_f1:+.4f}  ΔJudge={delta_j:+.4f}  "
+                  f"(per-session KB improvement)")
+        b_judge = judge_scores.get(("B", model_tag))
+        etsr_j  = judge_scores.get(("ET-S-R", model_tag))
+        if b_judge and etsr_j:
+            print(f"    ET-S-R Judge vs flat RAG (B): {etsr_j:.4f} vs {b_judge:.4f}  "
+                  f"({'above' if etsr_j > b_judge else 'below'} baseline)")
+
     print("\n" + "=" * 72)
 
 
@@ -1475,7 +1513,27 @@ def main():
     phase3_evaluate(args.models)
     if not args.skip_judge:
         phase3b_llm_judge(args.models, tensor_parallel_size=args.judge_tp)
-    phase4_report(args.models)
+
+    # Tee phase4_report output to both stdout and REPORT_ET.txt
+    class _Tee:
+        def __init__(self, *streams):
+            self.streams = streams
+        def write(self, data):
+            for s in self.streams:
+                s.write(data)
+        def flush(self):
+            for s in self.streams:
+                s.flush()
+
+    report_path = EVAL / "REPORT_ET.txt"
+    with open(report_path, "w") as rf:
+        _orig = sys.stdout
+        sys.stdout = _Tee(_orig, rf)
+        try:
+            phase4_report(args.models)
+        finally:
+            sys.stdout = _orig
+    log(f"[Phase 4] Report saved → {report_path}")
 
 
 if __name__ == "__main__":

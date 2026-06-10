@@ -1240,35 +1240,43 @@ def phase5_report(df: pd.DataFrame, llm_7b=None):
             narrative,
         ]
 
-    # ── ET / ET-S LLM judge scores (if available) ────────────────────────
-    et_judge_conds = ["ET", "ET-R", "ET-S", "ET-S-R"]
-    et_judge_rows = []
-    for cond in et_judge_conds:
+    # ── ET / ET-S comparison (F1 + judge, if results exist) ─────────────
+    et_conds = ["ET", "ET-R", "ET-S-R"]
+    et_rows  = []
+    for cond in et_conds:
         for model_tag in MODELS:
             path = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
             if not path.exists():
                 continue
-            vals = []
-            for line in path.open():
-                try:
-                    r = json.loads(line)
-                    v = r.get("llm_judge")
-                    if v is not None:
-                        vals.append(int(v))
-                except Exception:
-                    pass
-            if vals:
-                et_judge_rows.append(f"  {cond:<8}  [{model_tag}]  "
-                                     f"{sum(vals)/len(vals):.4f}  "
-                                     f"({sum(vals)}/{len(vals)} correct)")
+            records = [json.loads(l) for l in path.open()]
+            if not records:
+                continue
+            # F1 (may already be scored by run_engramtrace's phase3_evaluate)
+            f1_vals  = [r["f1"]        for r in records if r.get("f1")        is not None]
+            j_vals   = [r["llm_judge"] for r in records if r.get("llm_judge") is not None]
+            f1_mean  = sum(f1_vals) / len(f1_vals) if f1_vals else float("nan")
+            j_mean   = sum(j_vals)  / len(j_vals)  if j_vals  else float("nan")
+            n_toks   = [r.get("input_tokens", 0) for r in records]
+            avg_toks = sum(n_toks) / len(n_toks) if n_toks else 0
+            et_rows.append(
+                f"  {cond:<8}  [{model_tag}]  F1={f1_mean:.4f}  "
+                f"Judge={j_mean:.4f}  Tokens/QA={avg_toks:,.0f}"
+            )
 
-    if et_judge_rows:
+    if et_rows:
         report_lines += [
             "",
             "─" * 70,
-            "LLM JUDGE — EngramTrace Conditions (Qwen2.5-7B)",
+            "ENGRAMTRACE CONDITIONS (ET / ET-S-R vs A-E2 baselines)",
             "─" * 70,
-        ] + et_judge_rows
+            f"  {'Cond':<8}  {'Model':<6}  {'F1':>8}  {'LLM Judge':>10}  Tokens/QA",
+            "  " + "-" * 56,
+        ] + et_rows + [
+            "",
+            "  Key: ET   = LLM KB (single-call) + EngramTrace retrieval",
+            "       ET-R = LLM KB (single-call) + direct p-node retrieval",
+            "       ET-S-R = LLM KB (per-session) + direct p-node retrieval",
+        ]
 
     report_lines += [
         "",
