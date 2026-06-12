@@ -441,6 +441,83 @@ def run_evaluation(conditions: list, models: list):
     gc.collect()
 
 
+# ─── Judge ────────────────────────────────────────────────────────────────────
+
+def _parse_verdict(text: str) -> int:
+    t = text.strip().lower()
+    if "incorrect" in t and "correct" not in t.replace("incorrect", ""):
+        return 0
+    return 1 if "correct" in t else 0
+
+
+def run_judge(conditions: list, models: list,
+              tensor_parallel_size: int = 1,
+              gpu_memory_utilization: float = 0.90):
+    from vllm import LLM, SamplingParams
+
+    any_needed = any(
+        (RESULTS / f"condition_{c}" / f"{m}.jsonl").exists()
+        and any(r.get("llm_judge") is None
+                for r in [json.loads(l) for l in
+                           (RESULTS / f"condition_{c}" / f"{m}.jsonl").open()])
+        for c in conditions for m in models
+        if (RESULTS / f"condition_{c}" / f"{m}.jsonl").exists()
+    )
+    if not any_needed:
+        log("[Judge] All records already judged, skipping.")
+        return
+
+    tp = _valid_tp("7B", tensor_parallel_size)
+    log(f"[Judge] Loading Qwen2.5-7B judge (tp={tp})...")
+    judge_llm = LLM(
+        model=MODEL_IDS["7B"],
+        dtype="bfloat16",
+        tensor_parallel_size=tp,
+        gpu_memory_utilization=gpu_memory_utilization,
+        enforce_eager=False,
+        distributed_executor_backend="mp",
+    )
+    judge_params = SamplingParams(temperature=0.0, max_tokens=10)
+
+    for cond in conditions:
+        for model_tag in models:
+            path = RESULTS / f"condition_{cond}" / f"{model_tag}.jsonl"
+            if not path.exists():
+                continue
+            records = [json.loads(l) for l in path.open()]
+            if all(r.get("llm_judge") is not None for r in records):
+                log(f"  [Judge] {cond}/{model_tag}: already judged, skipping")
+                continue
+
+            pending = [(i, r) for i, r in enumerate(records) if r.get("llm_judge") is None]
+            log(f"  [Judge] {cond}/{model_tag}: judging {len(pending)} records...")
+
+            prompts = [
+                "You are evaluating whether a predicted answer correctly answers a question.\n\n"
+                f"Question: {r['question']}\n"
+                f"Reference Answer: {r['reference_answer']}\n"
+                f"Predicted Answer: {r['predicted_answer']}\n\n"
+                "Does the predicted answer correctly answer the question? "
+                "It is correct if it captures the key information, even if worded differently.\n"
+                "Reply with exactly one word: Correct or Incorrect."
+                for _, r in pending
+            ]
+            outputs = judge_llm.generate(prompts, judge_params)
+            for (i, _), out in zip(pending, outputs):
+                records[i]["llm_judge"] = _parse_verdict(out.outputs[0].text)
+
+            with path.open("w") as f:
+                for r in records:
+                    f.write(json.dumps(r) + "\n")
+
+            n_correct = sum(r.get("llm_judge", 0) for r in records)
+            log(f"  [Judge] {cond}/{model_tag}: {n_correct}/{len(records)} correct "
+                f"({100*n_correct/len(records):.1f}%)")
+
+    _teardown_vllm(judge_llm)
+    log("[Judge] Done.")
+
+
 # ─── Report ───────────────────────────────────────────────────────────────────
 
 def print_report(conditions: list, models: list):
@@ -463,6 +540,7 @@ def print_report(conditions: list, models: list):
 
     df = pd.DataFrame(rows)
     metric_cols = ["f1", "bleu1", "rougeL", "rouge2", "meteor", "sbert_sim"]
+    has_judge = "llm_judge" in df.columns and df["llm_judge"].notna().any()
 
     print("\n" + "=" * 72)
     print("SLM Retrieval Experiment — Results")
@@ -477,17 +555,34 @@ def print_report(conditions: list, models: list):
 
     for model_tag in models:
         print(f"\n── Model: {MODEL_IDS[model_tag]} ──")
+        cols = metric_cols + (["llm_judge"] if has_judge else [])
         print(f"  {'Cond':<8} {'Description':<30} " +
-              " ".join(f"{m:<10}" for m in metric_cols))
+              " ".join(f"{m:<10}" for m in cols))
         print("  " + "-" * 80)
         for cond in conditions:
             sub = df[(df["condition"] == cond) & (df["model_tag"] == model_tag)]
             if sub.empty:
                 continue
-            means = sub[metric_cols].mean()
             label = cond_labels.get(cond, cond)
-            print(f"  {cond:<8} {label:<30} " +
-                  " ".join(f"{means[m]:<10.4f}" for m in metric_cols))
+            vals = " ".join(f"{sub[m].mean():<10.4f}" for m in cols)
+            print(f"  {cond:<8} {label:<30} {vals}")
+
+    # Judge accuracy summary
+    if has_judge:
+        print("\n── LLM Judge Accuracy ──")
+        print(f"  {'Cond':<8} {'Description':<30} " +
+              " ".join(f"{m:<8}" for m in models))
+        print("  " + "-" * 56)
+        for cond in conditions:
+            label = cond_labels.get(cond, cond)
+            row = f"  {cond:<8} {label:<30} "
+            for model_tag in models:
+                sub = df[(df["condition"] == cond) & (df["model_tag"] == model_tag)]
+                if sub.empty or sub["llm_judge"].isna().all():
+                    row += f"{'—':<8} "
+                else:
+                    row += f"{sub['llm_judge'].mean():<8.4f} "
+            print(row)
 
     # Per-category F1
     print("\n── F1 by category ──")
@@ -533,6 +628,9 @@ def parse_args():
     p.add_argument("--conditions", nargs="+", default=["F1", "F2", "F3", "F4"],
                    choices=["F1", "F2", "F3", "F4"])
     p.add_argument("--skip-eval", action="store_true")
+    p.add_argument("--skip-judge", action="store_true")
+    p.add_argument("--judge-tp", type=int, default=1,
+                   help="Tensor-parallel size for the judge model (default: 1)")
     p.add_argument("--inference-only", action="store_true",
                    help="INTERNAL: subprocess mode — one model then exit")
     return p.parse_args()
@@ -580,6 +678,12 @@ def main():
     # ── Evaluation ────────────────────────────────────────────────────────
     if not args.skip_eval:
         run_evaluation(conditions, args.models)
+
+    # ── Judge ─────────────────────────────────────────────────────────────
+    if not args.skip_judge:
+        run_judge(conditions, args.models,
+                  tensor_parallel_size=args.judge_tp,
+                  gpu_memory_utilization=gpu_mem)
 
     # ── Report ────────────────────────────────────────────────────────────
     print_report(conditions, args.models)
