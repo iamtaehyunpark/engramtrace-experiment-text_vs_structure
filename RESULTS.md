@@ -301,34 +301,63 @@ A follow-up experiment adding a semantic retrieval layer using the 7B model itse
 
 ### Results
 
-#### F1 Score
+#### LLM Judge Accuracy (primary metric)
+
+| Condition | 72B | 7B |
+|---|---|---|
+| **F1** (Text→SLM→LLM) | **0.6167** | — |
+| F2 (Text→SLM→SLM) | — | **0.6141** |
+| F3 (XML→SLM→LLM) | 0.1213 | — |
+| F4 (XML→SLM→SLM) | — | 0.1420 |
+
+#### Full Accuracy Leaderboard (LLM Judge, all conditions)
+
+| Rank | Condition | 72B | 7B |
+|---|---|---|---|
+| 1 | A — Full Linear | 0.7827 | 0.6881 |
+| 2 | **F1 / F2 — SLM Retrieval** | **0.6167** | **0.6141** |
+| 3 | B — Flat RAG | 0.5143 | 0.4520 |
+| 4 | ET-S-R — Per-session KB | 0.4728 | 0.4812 |
+| 5 | E2 — Hier. HTML RAG | 0.2412 | 0.2510 |
+| 5 | C2 — Hier. XML RAG | 0.2412 | 0.2309 |
+| 7 | ET — Full EngramTrace | 0.2348 | 0.2062 |
+| 8 | ET-R — Single-call KB | 0.1634 | 0.2017 |
+| 9 | E — Full HTML | 0.1239 | 0.1083 |
+| 10 | F4 — XML→SLM→SLM | — | 0.1420 |
+| 11 | F3 — XML→SLM→LLM | 0.1213 | — |
+| 12 | C — Full XML | 0.0447 | 0.0363 |
+| 13 | D — No Memory | 0.0409 | 0.0642 |
+
+#### Token-overlap F1 Score (suppressed by verbose outputs — see note below)
 
 | Condition | Overall | Single-hop | Multi-hop | Temporal | Open-domain | Adversarial |
 |---|---|---|---|---|---|---|
-| **F1** (Text→SLM→LLM) | **0.0568** | 0.0403 | 0.0154 | 0.0455 | 0.0795 | 0.0183 |
-| F2 (Text→SLM→SLM) | 0.0460 | 0.0328 | 0.0122 | 0.0334 | 0.0648 | 0.0051 |
-| F3 (XML→SLM→LLM) | 0.0167 | 0.0179 | 0.0051 | 0.0278 | 0.0194 | 0.0045 |
-| F4 (XML→SLM→SLM) | 0.0199 | 0.0214 | 0.0076 | 0.0297 | 0.0230 | 0.0044 |
+| **F1** (Text→SLM→LLM, 72B) | 0.0568 | 0.0403 | 0.0154 | 0.0455 | 0.0795 | 0.0183 |
+| F2 (Text→SLM→SLM, 7B) | 0.0460 | 0.0328 | 0.0122 | 0.0334 | 0.0648 | 0.0051 |
+| F3 (XML→SLM→LLM, 72B) | 0.0167 | 0.0179 | 0.0051 | 0.0278 | 0.0194 | 0.0045 |
+| F4 (XML→SLM→SLM, 7B) | 0.0199 | 0.0214 | 0.0076 | 0.0297 | 0.0230 | 0.0044 |
+
+> **Note on token-overlap F1:** scores across all conditions are suppressed ~10× vs published LoCoMo benchmarks because instruction-tuned models generate verbose answers (e.g. "Based on the conversation, Alice went hiking last year") while reference answers are concise ("2022"). The LLM judge scores are the meaningful accuracy metric for this experiment.
 
 #### Token Efficiency vs. Prior Conditions (72B)
 
-| Condition | F1 | Avg. Input Tokens | F1/1k Tokens |
-|---|---|---|---|
-| A (full text) | 0.0582 | 23,326 | 0.0025 |
-| **F1 (SLM→LLM)** | **0.0568** | **884** | **0.0643** |
-| ET-S-R | 0.0635 | 496 | 0.1280 |
-| B (flat RAG) | 0.0423 | 473 | 0.0895 |
-| C2 (hier. XML RAG) | 0.0386 | 279 | 0.1382 |
+| Condition | Judge Accuracy | Avg. Input Tokens |
+|---|---|---|
+| A (full text) | 0.7827 | 23,326 |
+| **F1 (SLM→LLM)** | **0.6167** | **884** |
+| B (flat RAG) | 0.5143 | 473 |
+| ET-S-R | 0.4728 | 496 |
+| C2 (hier. XML RAG) | 0.2412 | 279 |
 
 ### Interpretation
 
-**F1 is the headline result.** SLM-based semantic retrieval from plain text achieves 97.6% of full-context accuracy (0.0568 vs 0.0582) at 3.8% of the token cost (884 vs 23,326 tokens). It outperforms all embedding-based retrieval conditions on raw accuracy — B (0.0423), C2 (0.0386), E2 (0.0359) — by a large margin, because the SLM understands the question and retrieves contextually relevant passages rather than matching surface-level similarity.
+**F1/F2 are the headline results.** SLM semantic retrieval from plain text achieves 78.8% (72B) and 89.2% (7B) of full-context accuracy at 3.8% of the token cost. More importantly, it **outperforms all previous retrieval methods on accuracy** — flat RAG (B: 0.514/0.452), ET-S-R (0.473/0.481), and embedding-based hierarchical retrieval (C2/E2: ~0.24) — by a wide margin. The SLM understands the question and retrieves contextually relevant passages rather than matching surface-level token similarity.
 
-**F2 matches flat RAG exactly** (0.0460 vs 0.0457 for 7B) at nearly double the token cost. Retrieval quality is on par; the bottleneck is 7B inference capacity, not the retriever.
+**F2 (7B-only pipeline) is particularly striking.** A single 7B model doing both retrieval and inference achieves 0.614 judge accuracy — above flat RAG (0.452) and ET-S-R (0.481) for 7B, and close to the 72B full-context ceiling (0.688).
 
-**F3/F4 (XML source) both fail.** F3 (0.0167) is worse than condition C (0.0176) despite the extra retrieval step. The root cause is not XML structure itself — the session/turn/date hierarchy is potentially useful — but how the text is sanitized during XML conversion. XML-escaping (`&` → `&amp;`, `<` → `&lt;`) and sentence splitting into individual `<utterance>` elements corrupt the natural prose. When the SLM retrieves from this, it returns escaped fragments rather than clean natural language, degrading inference quality. A fix would be to unescape retrieved text before passing it to the inference model, or to have the retriever return node indices rather than raw text.
+**F3/F4 (XML source) both fail.** F3 (0.121) sits below flat RAG and ET-S-R. The root cause is not XML structure itself — the session/turn/date hierarchy is potentially useful — but how the text is sanitized during XML conversion. XML-escaping (`&` → `&amp;`, `<` → `&lt;`) and sentence splitting into individual `<utterance>` elements corrupt the natural prose. When the SLM retrieves from this, it returns escaped fragments rather than clean natural language. A fix would be to unescape retrieved text before passing it to the inference model.
 
-**SLM retrieval vs. embedding retrieval.** The 7B model as a semantic retriever substantially outperforms `BAAI/bge-base-en-v1.5` on raw accuracy, but at a higher token cost per query (884 vs 279–473 tokens). For applications where accuracy matters more than marginal token savings, SLM retrieval from plain text is the stronger choice.
+**SLM retrieval is a qualitatively different class of approach.** Embedding retrieval (B, C2, E2) operates on surface-level similarity; SLM retrieval understands intent. This produces a large accuracy jump at modest additional token cost (884 vs 473 for B), making it a compelling middle ground between flat RAG and full context.
 
 ---
 
@@ -341,8 +370,8 @@ A follow-up experiment adding a semantic retrieval layer using the 7B model itse
 5. **Encoder quality is a key lever** — upgrading from MiniLM to bge-base improved all retrieval conditions by 12–21%
 6. **Per-session atomization is essential** — single-call LLM KB loses ~80% of facts; per-session retrieval closes the gap to flat RAG (H5 confirmed)
 7. **LLM-structured KB outperforms template chunking semantically** — ET-S-R judge 0.473 vs C2 0.241 for 72B; structured semantics enable better retrieval than verbatim chunking (H6 confirmed)
-8. **SLM semantic retrieval from plain text nearly matches full context** — F1 achieves 97.6% of condition A accuracy at 3.8% of token cost, outperforming all embedding-based retrieval on raw accuracy
-9. **XML sanitization corrupts SLM retrieval** — the problem with F3/F4 is XML escaping and sentence fragmentation during conversion, not XML structure per se; de-escaping retrieved text before inference would likely close the gap
+8. **SLM retrieval is the strongest retrieval approach** — F1/F2 achieve 0.617/0.614 judge accuracy, outperforming flat RAG (0.514/0.452), ET-S-R (0.473/0.481), and all embedding-based methods at 884 tokens vs 23,326 for full context
+9. **XML sanitization corrupts SLM retrieval** — F3/F4 fail not because of XML structure but because XML-escaping and sentence fragmentation corrupt the prose the SLM reads; de-escaping before inference would likely recover performance
 10. **Next steps:** Cross-session graph for multi-hop; fine-tune retriever on conversational QA; de-escaped XML retrieval (F3/F4 fix); evaluate on longer conversations where KB compression advantages compound
 
 ---
