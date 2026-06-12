@@ -142,13 +142,32 @@ import re as _re
 
 
 def load_locomo_dataset() -> dict:
-    """Load locomo10.json; returns {conversation_id: conv_dict}."""
+    """
+    Load locomo10.json and normalize into {conv_id: {conversation_id, sessions}}.
+    Raw format: list of {sample_id, conversation: {session_1: [...], session_1_date_time: ..., ...}}
+    """
     raw_path = DATA / "raw" / "locomo10.json"
-    with raw_path.open() as f:
-        data = json.load(f)
-    if isinstance(data, list):
-        return {c["conversation_id"]: c for c in data}
-    return data
+    raw = json.loads(raw_path.read_text())
+    result = {}
+    for idx, item in enumerate(raw):
+        conv    = item["conversation"]
+        conv_id = str(item.get("sample_id", idx))
+        sessions = []
+        s = 1
+        while f"session_{s}" in conv:
+            date_str = conv.get(f"session_{s}_date_time", f"Session {s}")
+            turns = [
+                {
+                    "speaker":   t["speaker"],
+                    "timestamp": t.get("dia_id", ""),
+                    "content":   t["text"],
+                }
+                for t in conv[f"session_{s}"]
+            ]
+            sessions.append({"date": date_str, "turns": turns})
+            s += 1
+        result[conv_id] = {"conversation_id": conv_id, "sessions": sessions}
+    return result
 
 
 def build_enriched_text(conv: dict) -> str:
