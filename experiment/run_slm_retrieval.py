@@ -8,17 +8,20 @@ Two-stage pipeline:
   Stage 2 (inference): LLM (72B or 7B) answers using the retrieved passages.
 
 Conditions:
-  F1 — Plain text  → 7B retrieval → 72B inference
-  F2 — Plain text  → 7B retrieval → 7B  inference
-  F3 — XML context → 7B retrieval → 72B inference
-  F4 — XML context → 7B retrieval → 7B  inference
+  F1 — Plain text     → 7B retrieval → 72B inference
+  F2 — Plain text     → 7B retrieval → 7B  inference
+  F3 — XML context    → 7B retrieval → 72B inference
+  F4 — XML context    → 7B retrieval → 7B  inference
+  F5 — Enriched text  → 7B retrieval → 72B inference
+  F6 — Enriched text  → 7B retrieval → 7B  inference
 
-Intermediate retrieval outputs are saved to results/condition_F{1-4}_retrieved/
-so the script is fully resume-safe.
+Enriched text embeds session/speaker/timestamp metadata inline as natural
+language (no XML tags or escaping), giving the SLM retriever richer context
+while keeping prose intact.
 
 Usage:
     python run_slm_retrieval.py --gpu h200x4
-    python run_slm_retrieval.py --gpu a100x8 --models 72B 7B
+    python run_slm_retrieval.py --gpu h200x1 --models 7B --conditions F5 F6
 """
 
 import os
@@ -59,13 +62,14 @@ GPU_PROFILES = {
     "a6000x4": (4, 0.90),
 }
 
-# F1/F2 share plain-text retrieval; F3/F4 share XML retrieval.
 # Retrieval source for each condition.
 RETRIEVAL_SOURCE = {
     "F1": "linear",
     "F2": "linear",
     "F3": "xml",
     "F4": "xml",
+    "F5": "enriched",
+    "F6": "enriched",
 }
 # Inference model for each condition.
 INFERENCE_MODEL = {
@@ -73,6 +77,8 @@ INFERENCE_MODEL = {
     "F2": "7B",
     "F3": "72B",
     "F4": "7B",
+    "F5": "72B",
+    "F6": "7B",
 }
 
 
@@ -82,9 +88,10 @@ def log(msg: str, level: str = "INFO"):
 
 
 def ensure_dirs():
-    for cond in ["F1", "F2", "F3", "F4"]:
+    for cond in ["F1", "F2", "F3", "F4", "F5", "F6"]:
         (RESULTS / f"condition_{cond}").mkdir(parents=True, exist_ok=True)
     RESULTS.mkdir(parents=True, exist_ok=True)  # for slm_retrieved_*.jsonl
+    (DATA / "condition_enriched").mkdir(parents=True, exist_ok=True)
     (EVAL / "scores").mkdir(parents=True, exist_ok=True)
     (EVAL / "tables").mkdir(parents=True, exist_ok=True)
 
@@ -131,14 +138,71 @@ def jsonl_count(path: Path) -> int:
 
 # ─── Representations ──────────────────────────────────────────────────────────
 
-def load_representations(conv_ids: list) -> dict:
-    log("Loading pre-built representations (linear + XML)...")
+import re as _re
+
+
+def load_locomo_dataset() -> dict:
+    """Load locomo10.json; returns {conversation_id: conv_dict}."""
+    raw_path = DATA / "raw" / "locomo10.json"
+    with raw_path.open() as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return {c["conversation_id"]: c for c in data}
+    return data
+
+
+def build_enriched_text(conv: dict) -> str:
+    """
+    Metadata-rich plain text: session header + one line per turn.
+    Speaker metadata (date, participants, turn count, timestamp) preserved
+    inline without any XML tags or escaping.
+
+    Example:
+        [Session 1 | May 7 2023 | Alice & Bob | 12 turns]
+        Alice (0_3): I went to the gym today.
+        Bob (0_4): How was it?
+    """
+    lines = []
+    for s_idx, session in enumerate(conv["sessions"]):
+        speakers = sorted({t["speaker"] for t in session["turns"]})
+        date = session.get("date", "unknown date")
+        n_turns = len(session["turns"])
+        header = (
+            f"[Session {s_idx + 1} | {date} | "
+            f"{' & '.join(speakers)} | {n_turns} turns]"
+        )
+        lines.append(header)
+        for turn in session["turns"]:
+            content = _re.sub(r"<[^>]+>", "", turn["content"])
+            ts = turn.get("timestamp", "")
+            label = f"{turn['speaker']} ({ts})" if ts else turn["speaker"]
+            lines.append(f"{label}: {content}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def build_enriched_representations(dataset: dict):
+    """Write enriched plain-text files to data/condition_enriched/{cid}.txt."""
+    out_dir = DATA / "condition_enriched"
+    for cid, conv in tqdm(dataset.items(), desc="  Build enriched reps", leave=False):
+        path = out_dir / f"{cid}.txt"
+        if not path.exists():
+            path.write_text(build_enriched_text(conv))
+    log(f"  Enriched representations ready in {out_dir}")
+
+
+def load_representations(conv_ids: list, sources: set) -> dict:
+    """Load only the representation sources actually needed by the requested conditions."""
+    log(f"Loading representations {sources}...")
     reps = {}
     for cid in tqdm(conv_ids, desc="  Load reps", leave=False):
-        reps[cid] = {
-            "linear": (DATA / "condition_A" / f"{cid}.txt").read_text(),
-            "xml":    (DATA / "condition_C" / f"{cid}.xml").read_text(),
-        }
+        reps[cid] = {}
+        if "linear" in sources:
+            reps[cid]["linear"] = (DATA / "condition_A" / f"{cid}.txt").read_text()
+        if "xml" in sources:
+            reps[cid]["xml"] = (DATA / "condition_C" / f"{cid}.xml").read_text()
+        if "enriched" in sources:
+            reps[cid]["enriched"] = (DATA / "condition_enriched" / f"{cid}.txt").read_text()
     return reps
 
 
@@ -351,12 +415,20 @@ def run_subprocess(model_tag: str, tp: int, gpu_mem: float, conditions: list):
 
     qa_pairs = [json.loads(l) for l in (QUESTIONS / "locomo_qa.jsonl").open()]
     conv_ids = sorted({qa["conversation_id"] for qa in qa_pairs})
-    reps = load_representations(conv_ids)
+
+    # Determine which retrieval sources are actually needed.
+    needed_sources = {RETRIEVAL_SOURCE[c] for c in conditions}
+
+    # Build enriched representations before loading if needed.
+    if "enriched" in needed_sources:
+        dataset = load_locomo_dataset()
+        build_enriched_representations(dataset)
+
+    reps = load_representations(conv_ids, needed_sources)
 
     # ── 7B subprocess: retrieval + SLM-only inference ─────────────────────
     if model_tag == "7B":
-        for source in ["linear", "xml"]:
-            # F1/F2 share linear retrieval; F3/F4 share xml retrieval
+        for source in needed_sources:
             out = RESULTS / f"slm_retrieved_{source}.jsonl"
             run_retrieval_stage(qa_pairs, reps, llm, tokenizer,
                                 source, out, max_input_tokens)
@@ -551,6 +623,8 @@ def print_report(conditions: list, models: list):
         "F2": "Text→SLM-retrieve→SLM",
         "F3": "XML→SLM-retrieve→LLM",
         "F4": "XML→SLM-retrieve→SLM",
+        "F5": "Enriched→SLM-retrieve→LLM",
+        "F6": "Enriched→SLM-retrieve→SLM",
     }
 
     for model_tag in models:
@@ -626,7 +700,7 @@ def parse_args():
     p.add_argument("--gpu", default="h200x4", choices=list(GPU_PROFILES))
     p.add_argument("--models", nargs="+", default=["72B", "7B"], choices=["72B", "7B"])
     p.add_argument("--conditions", nargs="+", default=["F1", "F2", "F3", "F4"],
-                   choices=["F1", "F2", "F3", "F4"])
+                   choices=["F1", "F2", "F3", "F4", "F5", "F6"])
     p.add_argument("--skip-eval", action="store_true")
     p.add_argument("--skip-judge", action="store_true")
     p.add_argument("--judge-tp", type=int, default=1,
