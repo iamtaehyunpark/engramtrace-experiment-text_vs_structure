@@ -28,6 +28,15 @@ import os
 os.environ["VLLM_USE_V1"] = "0"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+CONDA_ENV = "engramtrace-env"
+_conda_python = os.path.join(
+    os.path.expanduser("~"), "miniconda3", "envs", CONDA_ENV, "bin", "python"
+)
+PYTHON_EXEC = _conda_python if os.path.exists(_conda_python) else (
+    os.path.join(os.environ.get("CONDA_PREFIX", ""), "bin", "python")
+    if os.environ.get("CONDA_PREFIX") else __import__("sys").executable
+)
+
 import argparse
 import gc
 import json
@@ -756,7 +765,7 @@ def main():
     for model_tag in ordered_models:
         log(f"[Orchestrator] Launching subprocess for {model_tag}...")
         cmd = [
-            sys.executable, this_script,
+            PYTHON_EXEC, this_script,
             "--gpu", args.gpu,
             "--models", model_tag,
             "--conditions", *conditions,
